@@ -1,0 +1,8 @@
+[project]
+name = "dimergio"
+version = "0.1.0"
+description = "Smart file redistribution for mergerfs pools based on read observation"
+requires-python = ">=3.10"
+
+[project.scripts]
+dimergio = "dimergio.__main__:main"
