@@ -8,10 +8,9 @@ from pathlib import Path
 from .analyze import analyze
 from .collector import Collector
 from .config import load as load_config
-from .model import AnalysisResult
-from .mover import move_files
+from .model import AnalysisResult, MovePlan
+from .mover import execute_move_plan
 from .pool import find_pool
-from .selector import select_files
 from .state import StateManager
 
 logger = logging.getLogger(__name__)
@@ -73,7 +72,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
         return
 
     result = analyze(accumulators, pool, data_path, force_move=collector.force_move)
-    _handle_result(result, pool, verify=args.verify, accumulators=accumulators)
+    _handle_result(result, pool, verify=args.verify, move_plans=collector.move_plans)
 
 
 def cmd_analyze(args: argparse.Namespace) -> None:
@@ -95,7 +94,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         return
 
     result = analyze(accumulators, pool, data_path)
-    _handle_result(result, pool, verify=args.verify, accumulators=accumulators)
+    _handle_result(result, pool, verify=args.verify)
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -187,34 +186,28 @@ def cmd_undo(args: argparse.Namespace) -> None:
         _undo_one(args.pool, e, state)
 
 
-def _handle_result(result: AnalysisResult, pool, *, verify: bool = False, accumulators=None) -> None:
+def _handle_result(result: AnalysisResult, pool, *, verify: bool = False, move_plans: list[MovePlan] | None = None) -> None:
+    if move_plans:
+        cfg = load_config()
+        execute_move_plan(move_plans, pool, prefix=cfg.get("prefix", "_dimergio_"), verify=verify)
+        return
+
     if not result.candidates:
         print("No files on slow branches to move.")
         ans = input("Force move files to a different tier? (downgrade) [y/N]: ").strip().lower()
         if ans not in ("y", "yes"):
             return
-        if accumulators is None:
-            print("No accumulator data available for force-move.")
-            return
-        # Re-analyze with force_move to include all files
-        result = analyze(accumulators, pool, force_move=True)
-        if not result.candidates:
-            print("Still no files to move.")
-            return
-        print("⚠ Force-move enabled — files may be moved to slower tiers.")
+        print("Force-move enabled — files may be moved to slower tiers.")
+        return
 
     if result.total_iowait == 0.0:
         from .analyze import rank_by_reads
         result = rank_by_reads(result)
         print("Note: no I/O wait data available (offline log). Ranking by read count.")
 
-    selected = select_files(result)
-    if selected is None:
-        print("No files selected.")
-        return
-
-    cfg = load_config()
-    move_files(selected, pool, prefix=cfg.get("prefix", "_dimergio_"), verify=verify)
+    print(f"\n{len(result.candidates)} candidates identified. Run the TUI to select files:")
+    print("  dimergio watch --pool <mount>")
+    print()
 
 
 def _parse_log(log_path: Path, pool, data_path: Path) -> dict:
