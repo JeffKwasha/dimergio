@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, unsafe_hash=True)
 class Branch:
     path: Path
     device: str           # e.g. "dm-3"
@@ -46,7 +46,7 @@ class ReadEvent:
     gid: int
     timestamp: float
     branch_idx: int
-    device_busy_pct: float
+    iowait_sec: float
 
 
 @dataclass(slots=True)
@@ -58,12 +58,24 @@ class FileAccumulator:
     last_seen: float = 0.0
     iowait_debt: float = 0.0
 
-    def observe(self, ts: float, busy_pct: float) -> None:
+    def observe(self, ts: float, iowait_sec: float) -> None:
         self.total_reads += 1
-        self.iowait_debt += busy_pct
+        self.iowait_debt += iowait_sec
         if not self.first_seen:
             self.first_seen = ts
         self.last_seen = ts
+
+
+@dataclass(slots=True)
+class PidStat:
+    pid: int
+    process_name: str
+    read_count: int = 0
+    first_seen: float = 0.0
+    last_seen: float = 0.0
+    total_iowait_sec: float = 0.0
+    tracked: bool = False
+    exited: bool = False
 
 
 @dataclass(slots=True)

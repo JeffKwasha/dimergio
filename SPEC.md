@@ -524,10 +524,11 @@ commands:
 
 watch options:
   --pool PATH   Mergerfs pool mount point  [default: /mnt/games]
-  --data PATH   Restrict to reads under PATH  [default: pool root]
-  --process NAME  Auto-quit when process NAME stops reading files
-  --pid N       Auto-quit when PID N exits
-  --sudo        Prepend sudo to fatrace invocation
+  --data PATH   Restrict to reads under this path (default: CWD inside pool, else pool root)
+  --process NAME  Auto-quit when this process exits (matches /proc/<pid>/cmdline)
+  --pid N       Auto-quit when this PID exits
+  --sudo        Run fatrace via sudo (needs CAP_SYS_ADMIN for fanotify)
+  --no-interactive  Disable interactive PID monitor (headless mode)
 
 analyze options:
   --log PATH    Path to existing fatrace log file

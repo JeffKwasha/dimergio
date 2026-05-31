@@ -166,10 +166,10 @@ class TestReadEvent:
             gid=1000,
             timestamp=1000000.0,
             branch_idx=0,
-            device_busy_pct=75.0,
+            iowait_sec=0.075,
         )
         assert e.file_path.name == "f.dat"
-        assert e.device_busy_pct == 75.0
+        assert e.iowait_sec == 0.075
         assert e.process_name == "myapp"
 
 

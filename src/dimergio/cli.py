@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -13,6 +14,28 @@ from .pool import find_pool
 from .selector import select_files
 from .state import StateManager
 
+logger = logging.getLogger(__name__)
+
+
+def _resolve_data_path(args_data: str | None, pool) -> Path:
+    from pathlib import Path
+    if args_data:
+        return Path(args_data)
+    cwd = Path.cwd().resolve()
+    try:
+        cwd.relative_to(pool.mount)
+        return cwd
+    except ValueError:
+        pass
+    for branch in pool.branches:
+        try:
+            rel = cwd.relative_to(branch.path.resolve())
+            mapped = pool.mount / rel
+            return mapped.resolve()
+        except ValueError:
+            continue
+    return pool.mount
+
 
 def cmd_watch(args: argparse.Namespace) -> None:
     pool = find_pool(args.pool)
@@ -20,10 +43,15 @@ def cmd_watch(args: argparse.Namespace) -> None:
         print(f"Error: no mergerfs pool found at '{args.pool}'")
         sys.exit(1)
 
-    data_path = Path(args.data) if args.data else pool.mount
+    data_path = _resolve_data_path(args.data, pool)
     if not data_path.exists():
         print(f"Error: data path '{data_path}' does not exist")
         sys.exit(1)
+
+    logger.info("pool=%s data=%s", pool.mount, data_path)
+    for b in pool.branches:
+        kind = "HDD" if b.rotational else "SSD"
+        logger.info("branch: %s [%s] on %s", b.path, kind, b.device)
 
     cfg = load_config()
     iowait_ms = args.iowait_interval or cfg.get("iowait_interval_ms", 10)
@@ -35,6 +63,8 @@ def cmd_watch(args: argparse.Namespace) -> None:
         pid=args.pid,
         use_sudo=args.sudo,
         iowait_interval_ms=iowait_ms,
+        no_interactive=args.no_interactive,
+        verbose=args.verbose,
     )
     accumulators = collector.run()
 
@@ -52,7 +82,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         print(f"Error: no mergerfs pool found at '{args.pool}'")
         sys.exit(1)
 
-    data_path = Path(args.data) if args.data else pool.mount
+    data_path = _resolve_data_path(args.data, pool)
     log_path = Path(args.log)
 
     if not log_path.exists():
@@ -273,22 +303,31 @@ def _fmt_bytes(b: int) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from . import __version__
+
     parser = argparse.ArgumentParser(
         prog="dimergio",
         description="Smart file redistribution for mergerfs pools based on read observation.",
     )
+    parser.add_argument("--version", action="version", version=f"dimergio {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     wp = sub.add_parser("watch", help="Run fatrace, collect, analyze, and move files")
     wp.add_argument("--pool", default="/mnt/games", help="Mergerfs pool mount point")
-    wp.add_argument("--data", help="Restrict to reads under this path")
-    wp.add_argument("--process", help="Auto-quit when process stops reading")
-    wp.add_argument("--pid", type=int, help="Auto-quit when PID exits")
-    wp.add_argument("--sudo", action="store_true", help="Prepend sudo to fatrace")
+    wp.add_argument("--data", help="Restrict to reads under this path (default: CWD inside pool, else pool root)")
+    wp.add_argument("--process",
+                    help="Auto-quit when this process exits (matches /proc/<pid>/cmdline)")
+    wp.add_argument("--pid", type=int, help="Auto-quit when this PID exits")
+    wp.add_argument("--sudo", action="store_true",
+                    help="Run fatrace via sudo (needs CAP_SYS_ADMIN for fanotify)")
     wp.add_argument("--iowait-interval", type=int, default=10,
                     help="I/O wait sampling interval in ms (default: 10 = 100Hz)")
     wp.add_argument("--verify", action="store_true",
                     help="SHA256-verify each file after copy")
+    wp.add_argument("--no-interactive", action="store_true",
+                    help="Disable interactive PID monitor (headless mode)")
+    wp.add_argument("--verbose", "-v", action="store_true",
+                    help="Log raw fatrace output and parsing decisions to stderr")
 
     ap = sub.add_parser("analyze", help="Analyze existing fatrace log")
     ap.add_argument("--log", required=True, help="Path to fatrace log file")

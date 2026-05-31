@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import logging
 import sys
 
+from . import __version__
 from .cli import build_parser, cmd_analyze, cmd_cleanup, cmd_status, cmd_undo, cmd_watch
 
 
 def main() -> None:
+    logging.basicConfig(
+        format="[dimergio] %(levelname)s %(message)s",
+        stream=sys.stderr,
+        level=logging.INFO,
+    )
+    logger = logging.getLogger("dimergio")
+    logger.info("dimergio v%s", __version__)
+
     parser = build_parser()
     args = parser.parse_args()
 

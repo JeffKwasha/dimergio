@@ -1,5 +1,29 @@
 # dimergio
 
+## Purpose
+
+Linux has some great options for IO caching... At the high end.
+LVM2 cache is good, but if the drive dies you're in for some pain.
+ZFS is also great... if you have plenty of memory...
+Bcachefs is very promising, but not ready yet.
+
+So if you want to turbo charge a pool of spinning rust with a bit of NAND what can you do?
+
+For many mergerfs fills this gap... But there's no system for distributing files.
+
+dimergio was written (poorly) to perform the analysis in realtime on a live system and
+distribute files between mergerfs component filesystems in a bid to squeeze the most
+user experience out of your precious NAND.
+
+The motivating usecase is game data files which can easily consume 50GB per title and expect
+random access to be nearly instant.  Devs assume everyone has their library on a Gen4 nvme.
+But the majority of game data is rarely used, while a few files are indispensable.
+So dimergio aims to watch and notice which files have the most bang for your bytes.
+Keeping writable and rarely read files on a second disk can increase IOPS and throughput 
+if file distribution is ideal, and keeping unchanging files on NAND preserves lifespan.
+
+## Method
+
 Watch file reads via `fatrace`, correlate with device I/O wait, and
 migrate heavy-read files from slow → fast [mergerfs](https://github.com/trapexit/mergerfs)
 branches. No write benchmarking, no hardware assumptions — all heuristics
