@@ -72,8 +72,8 @@ def cmd_watch(args: argparse.Namespace) -> None:
         print("No read events collected. Nothing to analyze.")
         return
 
-    result = analyze(accumulators, pool, data_path)
-    _handle_result(result, pool, verify=args.verify)
+    result = analyze(accumulators, pool, data_path, force_move=collector.force_move)
+    _handle_result(result, pool, verify=args.verify, accumulators=accumulators)
 
 
 def cmd_analyze(args: argparse.Namespace) -> None:
@@ -95,7 +95,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         return
 
     result = analyze(accumulators, pool, data_path)
-    _handle_result(result, pool, verify=args.verify)
+    _handle_result(result, pool, verify=args.verify, accumulators=accumulators)
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -187,10 +187,21 @@ def cmd_undo(args: argparse.Namespace) -> None:
         _undo_one(args.pool, e, state)
 
 
-def _handle_result(result: AnalysisResult, pool, *, verify: bool = False) -> None:
+def _handle_result(result: AnalysisResult, pool, *, verify: bool = False, accumulators=None) -> None:
     if not result.candidates:
         print("No files on slow branches to move.")
-        return
+        ans = input("Force move files to a different tier? (downgrade) [y/N]: ").strip().lower()
+        if ans not in ("y", "yes"):
+            return
+        if accumulators is None:
+            print("No accumulator data available for force-move.")
+            return
+        # Re-analyze with force_move to include all files
+        result = analyze(accumulators, pool, force_move=True)
+        if not result.candidates:
+            print("Still no files to move.")
+            return
+        print("⚠ Force-move enabled — files may be moved to slower tiers.")
 
     if result.total_iowait == 0.0:
         from .analyze import rank_by_reads

@@ -9,6 +9,7 @@ def analyze(
     accumulators: dict[Path, FileAccumulator],
     pool: Pool,
     data_path: Path | None = None,
+    force_move: bool = False,
 ) -> AnalysisResult:
     dp = data_path or pool.mount
     fastest = pool.fastest_branch
@@ -25,7 +26,7 @@ def analyze(
     raw: list[Candidate] = []
 
     for acc in accumulators.values():
-        if acc.branch_idx == fastest_idx:
+        if not force_move and acc.branch_idx == fastest_idx:
             continue  # already on fastest branch
 
         rel = _safe_relative(acc.path, dp)

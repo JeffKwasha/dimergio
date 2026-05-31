@@ -134,6 +134,7 @@ class Collector:
         self._volume_mounts: list[tuple[Path, Path, int]] = []
         self._written_paths: set[Path] = set()
         self._verbose = verbose
+        self.force_move = False
         self._build_volume_map()
 
     def _build_volume_map(self) -> None:
@@ -501,19 +502,20 @@ class Collector:
                 f"[bold]     iowait:[/bold]  {'  '.join(iowait_parts)}"
             )
 
+            # Check if all files are on the same tier (no moves possible)
+            active_tiers = sum(1 for r in tier_reads if r > 0)
+            if active_tiers <= 1 and n_files > 0:
+                tier_stats.append("\n")
+                tier_stats.append("[bold yellow]⚠ All files on same tier — no upgrades available.[/bold yellow]", style="bold yellow")
+                tier_stats.append("\n")
+                tier_stats.append("[dim]Press 'f' to force-move files (downgrade).[/dim]", style="dim")
+
             status = Text(status_text, style=status_style) if status_text else ""
 
             return Panel(
                 Group(header, tiers_line, watching_line, proc_table, file_table, tier_stats, status),
                 title=f"dimergio — {self.pool.mount}",
-                subtitle="q:quit  ↑↓:select  Space:toggle  s:show-exited  []:sample-rate",
-                border_style="dim",
-            )
-
-            return Panel(
-                Group(header, table, status),
-                title=f"dimergio — {self.pool.mount}",
-                subtitle="q:quit  ↑↓:select  Space:toggle  s:show-exited  []:sample-rate",
+                subtitle="q:quit  ↑↓:select  s:show-exited  []:sample-rate  f:force-move",
                 border_style="dim",
             )
 
@@ -553,6 +555,9 @@ class Collector:
                 auto_quit = not auto_quit
             elif key == "M":
                 nand_warn = not nand_warn
+            elif key == "f":
+                self.force_move = True
+                return True
             return False
 
         import termios
