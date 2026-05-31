@@ -13,63 +13,49 @@ benchmarking is performed. No assumptions are made about hardware latency.
 | Term | Definition |
 |---|---|
 | **pool** | A mergerfs mount (e.g. `/mnt/games`), composed of multiple **branches** |
-| **branch** | A filesystem path that is a member of a mergerfs pool |
-| **fast branch** | The branch with the lowest device I/O busy-time — empirically measured during the observation session |
-| **slow branch** | Any branch that is not the fast branch |
-| **candidate** | A file on a slow branch whose migration could reduce observed I/O wait |
-| **iowait debt** | A per-file score; the sum of device-busy percentage at the time each read of that file occurred. Higher = more I/O impact. |
-| **observation session** | The period during which fatrace is running and the program is active |
+| **branch** | A filesystem path that is a member of a mergerfs pool. Each branch has a **speed class** and a **speed weight**. |
+| **speed class** | Auto-detected tier from `rotational` flag + device name prefix. One of: `nvme`, `ssd`, `hdd`. |
+| **speed weight** | Relative throughput estimate. Computed as `bytes_read / iowait_sec` per branch during observation. Used for target distribution. Defaults: hdd=1, ssd=4, nvme=10. |
+| **branch stats** | Per-branch cumulative totals: reads, writes, iowait_sec. Computed on-demand from per-file data, not maintained separately. |
+| **target distribution** | Ideal iowait split: `weight[i] / sum(weights)`. The goal for balanced IO across tiers. |
+| **gap** | `target - actual` per branch. Positive = spare capacity (can receive files). Negative = overloaded (can give away files). |
+| **candidate** | A file on an overloaded branch whose migration reduces iowait toward the target distribution. |
+| **iowait debt** | Per-file score: sum of iowait_sec at each read event. Higher = more I/O impact. Primary ranking metric. |
+| **observation session** | The period during which fatrace is running and the TUI is active. Runs in interactive mode (Rich TUI) or passive mode (headless). |
 
 ## 3. Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                       dimergio CLI                           │
-│  watch │ analyze │ status │ cleanup │ undo                    │
+│  dimergio --pool /mnt/games --pid 12345 --sudo              │
 └─────────────────────────────────────────────────────────────┘
          │
-         ├── pool.py         Mergerfs discovery, branch mapping
-         ├── collector.py    fatrace subprocess + iowait sampler
-         ├── eventlog.py     ReadEvent stream, FileAccumulator
-         ├── analyze.py      Aggregation, ranking, 80/20
-         ├── selector.py     Interactive table + prompt
-         ├── mover.py        Copy → verify → rename → state
-         ├── state.py        JSON state per pool
-         └── config.py       ~/.config/dimergio/config.json
+         ├── __init__.py      Package version (0.1.1)
+         ├── __main__.py      Entry point (python -m dimergio), logging config
+         ├── pool.py          Mergerfs discovery from /proc, branch speed class auto-detection
+         ├── collector.py     fatrace subprocess, IOWait sampling, Rich TUI, process tracking
+         └── model.py         Data classes (Pool, Branch, ReadEvent, FileAccumulator,
+                               PidStat, Candidate) and analysis logic
 ```
 
 ### 3.1 Data Flow
 
 ```
-FATRACE (subprocess)                IOWAIT SAMPLER (thread)
-  stdout line-by-line                /proc/diskstats every 50ms
-         │                                    │
-         ▼                                    ▼
-  ┌─────────────────────────────┐
-  │       eventlog.py           │
-  │  merges into per-file       │
-  │  FileAccumulator records    │
-  └──────────┬──────────────────┘
-             │ Ctrl+C / process exit
-             ▼
-  ┌─────────────────────────────┐
-  │       analyze.py            │
-  │  80/20 by iowait debt       │
-  │  rank candidates             │
-  └──────────┬──────────────────┘
-             │ interactive
-             ▼
-  ┌─────────────────────────────┐
-  │       selector.py           │
-  │  table + prompt → selections │
-  └──────────┬──────────────────┘
-             │ user confirms
-             ▼
-  ┌─────────────────────────────┐
-  │       mover.py              │
-  │  copy → verify → rename     │
-  │  record in state            │
-  └─────────────────────────────┘
+fatrace -f RW -u -t -p <pid>
+    │
+    ▼
+collector._parse_line()          ─── ReadEvent(timestamp, proc, pid, uid, event_type, file_path)
+    │                                Also: PidStat.process_name (resolved from /proc/<pid>/comm)
+    │
+    ├── collector._sample_iowait() ─── iowait_sec (delta, fairness-weighted among events in window)
+    │
+    ├── collector._accumulate()    ─── FileAccumulator.total_reads++  (R events)
+    │                                  FileAccumulator.write_count++   (W events)
+    │                                  FileAccumulator.iowait_debt += iowait_sec
+    │
+    └── collector._update_pid_stats() ── PidStat.read_count++, pid_iowait_sec[pid] += iowait_sec
+                                          PidStat.write_count++ on W events
 ```
 
 ## 4. Pool Discovery (pool.py)
@@ -92,53 +78,111 @@ For each branch path (e.g. `/mnt/slow`):
 3. Identify `dm-X` from the device path
 4. Store mapping: `branch → {device: dm-X, rotational: from /sys/block/dm-X/queue/rotational}`
 
-### 4.3 Identify fast branch
+### 4.3 Speed class auto-detection
 
-No write benchmark. The fast branch is the one with the LOWEST `io_ticks`
-accumulation per read-byte during the observation session. This is determined
-**after** collection, by comparing per-branch `total_read_io_time / total_bytes_read`.
+Each branch is classified into a speed tier based on two signals:
 
-Pre-session hint: the branch where `queue/rotational == 0` (SSD/NVMe) is
-presumed fast. The empirical data may override this.
+1. **`rotational` flag** (`/sys/block/<dev>/queue/rotational`): 0 = NAND, 1 = platter
+2. **Device name prefix**: `nvme` = NVMe, `sd`/`vd` = SSD/HDD, `md` = RAID
 
-## 5. Data Collection (collector.py, eventlog.py)
+Decision matrix:
+
+| rotational | device prefix | speed class | default weight |
+|---|---|---|---|
+| 0 | `nvme` | `nvme` | 10 |
+| 0 | `sd`/`vd`/`dm` | `ssd` | 4 |
+| 1 | `sd`/`vd`/`dm` | `hdd` | 1 |
+| 0/1 | `md`/`dm` (RAID) | `hdd` (conservative) | 1 |
+
+Weight defaults are overridable by the user. Live speed weights are computed
+from `bytes_read / iowait_sec` per branch during observation.
+
+### 4.4 Branch short labels
+
+Short labels for display are derived from the last path component of each branch,
+with common suffixes stripped (`_games`, `_nvme`, `_ssd`, `_r1`, etc.):
+
+| Branch path | Short label |
+|---|---|
+| `/mnt/@/ssd_games` | `ssd` |
+| `/mnt/@/r1_games` | `r1` |
+| `/mnt/@/nvme0` | `nvme` |
+
+Duplicate labels are disambiguated with an index suffix (e.g. `r1`, `r2`).
+
+### 4.5 Volume path remapping
+
+fatrace reports paths through the btrfs volume mount (e.g. `/mnt/@/ssd_games/Data/...`),
+not the user-facing pool-relative path (`Data/...`). The collector builds a volume map
+from `/proc/mounts` to remap each fatrace path to a pool-relative path. This enables
+consistent file tracking across branches that use different mount layouts.
+
+## 5. Data Collection (collector.py)
 
 ### 5.1 Subprocess: fatrace
 
 ```
-fatrace -c -f R -u -t -t
+/usr/sbin/fatrace -f RW -u -t -p <pid>
 ```
 
 | Flag | Purpose |
 |---|---|
-| `-c` | Only events on the current mount (CWD set to pool root) |
-| `-f R` | Read events only |
+| `-f RW` | Read and write events (write tracking for move candidates) |
 | `-u` | Include `[uid:gid]` for user filtering |
-| `-t -t` | Two timestamps → epoch seconds.microseconds |
+| `-t` | Timestamp in epoch seconds |
+| `-p <pid>` | Only events from this PID |
+
+Note: `-c` (only current mount) is NOT used — fanotify cannot watch FUSE/mergerfs
+mounts. Instead, fatrace runs against the raw btrfs volume mounts, and paths are
+remapped to pool-relative via the volume map (Section 4.5).
 
 Output format (per line):
 
 ```
-TIMESTAMP PROCESS(PID)[UID:GID]: EVENT PATH
+TIMESTAMP PROCESS(PID)[UID:GID]: EVENT /path
 
-Example:
-  1748573021.456789 myapp(12345)[1000:1000]: R /mnt/pool/Data/file.ba2
+Examples:
+  1748573021.456789 myapp(12345)[1000:1000]: R /mnt/@/ssd_games/Data/file.ba2
+  1748573021.456789 myapp(12345)[1000:1000]: W /mnt/@/r1_games/Data/save.dat
 ```
 
-Lines for non-read events, different UIDs, or paths outside the pool are
-discarded. A line is parsed as:
+Note the space between `)` and `[` in the fatrace output: `cmd(pid) [uid:gid]`.
+
+### 5.2 Regex parsing
+
+A compiled regex with named groups parses each fatrace line:
 
 ```python
-match line.split():
-    case [ts_str, rest]:
-        ts = float(ts_str.removesuffix('.'))
-        # rest: "process(pid)[uid:gid]: EVENT /path"
-        # regex or split parse
+TS = r"(?P<ts>\d+\.\d+)"
+PROC = r"(?P<comm>[^(]+)"
+PID = r"(?P<pid>\d+)"
+UID = r"(?P<uid>\d+)"
+GID = r"(?P<gid>\d+)"
+EVENT = r"(?P<event>\w)"
+PATH = r"(?P<path>.*)"
+S = r"\s+"
+
+FATRACE_RE = re.compile(
+    rf"^{TS}\s+{PROC}\({PID}\)\s*\[{UID}:{GID}\]:\s*{EVENT}\s+{PATH}$"
+)
 ```
 
-### 5.2 I/O Wait Sampler (background thread)
+Key details:
+- `\s+` between event code and path (variable padding in fatrace output)
+- `.*` for PATH — paths can contain spaces (e.g. `EVERSPACE™ 2/Data/...`)
+- Event `R` = read, `W` = write, `O` = open, `C` = close, `D` = delete, `+` = create
+- Write events (`W`) mark files in `_written_paths` and increment `write_count`
 
-Every **50ms**, read `/sys/block/<dm-X>/stat` for each branch device.
+### 5.3 UID filter
+
+When `--sudo` is NOT used: skip lines where uid ≠ current user's uid.
+When `--sudo` IS used: skip UID check (fatrace runs as root).
+
+### 5.4 I/O Wait Sampler (background thread)
+
+Every **10ms** (100Hz default), read `/sys/block/<dm-X>/stat` for each branch device.
+The sample interval is adjustable at runtime via `[` and `]` keys (5ms increments,
+minimum 5ms = 200Hz max).
 
 Format (17 fields):
 ```
@@ -157,20 +201,29 @@ num_reads_delta = read_io[t] - read_io[t-1]     # reads completed since last sam
 read_ticks_delta = read_ticks[t] - read_ticks[t-1]  # ms spent reading
 ```
 
+**Fairness weighting**: When multiple reads are observed within a single 50ms
+sampling window, the iowait delta for that window is divided equally among them.
+This prevents inflating debt when many reads complete simultaneously.
+
 Store a **rolling window** (last 3 samples, 150ms) of busy_pct for smoothing.
 Maintain a thread-safe reference to the latest smoothed busy_pct per branch.
 
-### 5.3 Event Capture
+### 5.5 Event Capture
 
 On each fatrace line (from the main thread):
 
-1. Parse: timestamp, pid, uid, event_type, path
-2. **Filter**: skip unless event_type is `R`, uid matches current user, path starts with data root
-3. **Determine branch**: which branch path is a prefix of this file's path?
-4. **Look up current iowait**: read the latest smoothed `io_busy_pct` for that branch
-5. **Accumulate**: update the FileAccumulator for this path
+1. Parse: timestamp, proc, pid, uid, event_type, path
+2. **UID filter**: skip if uid ≠ current user (unless `--sudo`)
+3. **Path filter**: convert to Path, skip if not under `data_path`
+4. **Volume remap**: if path is through btrfs volume mount, remap to pool-relative
+5. **Write detection**: if event is `W`, add path to `_written_paths` and increment `write_count`
+6. **Branch resolution**: match path prefix against branch paths to identify branch
+7. **IOWait**: read latest smoothed `io_busy_pct` for that branch
+8. **Accumulate**: update the FileAccumulator for this path
+9. **PID tracking**: update PidStat (read_count, write_count, process_name from `/proc/<pid>/comm`)
+10. **Return** ReadEvent for TUI consumption
 
-### 5.4 FileAccumulator
+### 5.6 FileAccumulator
 
 ```python
 @dataclass
@@ -178,63 +231,49 @@ class FileAccumulator:
     path: Path
     branch: str              # which mergerfs branch (identifies the device)
     total_reads: int = 0
+    write_count: int = 0     # W events on this file
     first_seen: float = 0.0   # epoch seconds
     last_seen: float = 0.0
-    iowait_debt: float = 0.0  # sum of io_busy_pct at each read event
+    iowait_debt: float = 0.0  # sum of iowait_sec at each read event
     _peak_read_rate: float = 0.0  # for secondary heuristic
 
-    def observe(self, ts: float, busy_pct: float) -> None:
+    def observe(self, ts: float, iowait_sec: float) -> None:
         self.total_reads += 1
-        self.iowait_debt += busy_pct
+        self.iowait_debt += iowait_sec
         if not self.first_seen:
             self.first_seen = ts
         self.last_seen = ts
 ```
 
-Three ranking metrics are derived from this:
+### 5.7 PidStat
 
-| Metric | Formula | Meaning |
-|---|---|---|
-| **iowait debt** | `accum.iowait_debt` | Reads × device busy % — the primary metric |
-| **read weight** | `accum.total_reads` | Simple count of read events |
-| **density** | `accum.total_reads / (accum.last_seen - accum.first_seen + ε)` | Read rate; high density suggests frequent, possibly cached, access |
+```python
+@dataclass
+class PidStat:
+    pid: int
+    process_name: str          # resolved from /proc/<pid>/comm (cached)
+    read_count: int = 0
+    write_count: int = 0
+    iowait_sec: float = 0.0    # sum of iowait for reads by this PID
+```
 
-### 5.5 Checkpoint
+Process name resolution: read `/proc/<pid>/comm`, cache in PidStat.
+Fallback: use fatrace `comm` field (may be abbreviated for long names).
 
-Every 60 seconds, the accumulator dict is serialized to a JSON checkpoint
-in `~/.local/share/dimergio/checkpoint.<pool>.json` for crash recovery.
-On restart/analyze, the checkpoint is loaded and new events are merged.
+### 5.8 Auto-quit
 
-### 5.6 Auto-quit
+Default in interactive mode: OFF. User toggles with `a` key on monitor screen.
 
-If `--pid PID` is given:
-- A separate thread polls `/proc/<pid>/status` every 1 second
-- When the PID disappears → set `stop_flag = True`
-- The main loop checks `stop_flag` after each fatrace line
-
-If `--process NAME` is given:
-- After each fatrace event, update `last_event_time[process_name]`
-- When no events from `NAME` have arrived in 30 seconds → stop
-
-Without either: let fatrace run until Ctrl+C or Ctrl+D is received.
+If `--pid PID` is given (passive mode): auto-quit ON by default.
+If `--process NAME` is given (passive mode): auto-quit ON by default.
+`--auto-quit` CLI flag explicitly enables it for interactive mode.
 
 On stop:
 1. TERM the fatrace subprocess
 2. Read any remaining buffered output
-3. Write final checkpoint
-4. Proceed to analysis
+3. Proceed to analysis/selection
 
-### 5.7 Phase tracking in output
-
-While collecting, print a short periodic status (every 30s) to stderr:
-
-```
-[dimergio] collecting... 3m14s | 45,832 reads | 187 files tracked | hdd_branch busy: 34%
-```
-
-No progress bar. No TUI during collection. The TUI appears only during selection.
-
-## 6. Analysis (analyze.py)
+## 6. Analysis (model.py)
 
 ### 6.1 Input
 
@@ -246,114 +285,177 @@ For each accumulator, look up:
 
 - **File size**: `os.stat(accum.path).st_size` (cached in the accumulator)
 - **Branch**: already recorded
-- **Is candidate**: `True` if the file is on a slow branch (not the fastest)
+- **Writes**: `accum.write_count` (W events)
 
-### 6.3 Sorting & Ranking
+### 6.3 Branch stats (derived)
 
-The user picks a ranking metric at analysis time. Default is **iowait debt**.
+Per-branch totals are computed on-demand from per-file accumulators:
 
 ```python
-candidates = [
-    Candidate(
-        path=acc.path,
-        reads=acc.total_reads,
-        iowait_debt=acc.iowait_debt,
-        branch=acc.branch,
-        file_size=acc.file_size,
-    )
-    for acc in accumulators.values()
-    if acc.branch != fastest_branch
-]
-candidates.sort(key=lambda c: c.iowait_debt, reverse=True)
+def branch_stats(accumulators: dict[Path, FileAccumulator], branches: list[Branch]):
+    stats = {b: {"reads": 0, "writes": 0, "iowait": 0.0} for b in branches}
+    for acc in accumulators.values():
+        b = branch_by_path[acc.branch]
+        stats[b]["reads"] += acc.total_reads
+        stats[b]["writes"] += acc.write_count
+        stats[b]["iowait"] += acc.iowait_debt
+    return stats
 ```
 
-### 6.4 80/20 Analysis
+No separate branch-level counters — one pass over accumulators is sufficient.
+
+### 6.4 Target distribution
 
 ```
-let total_iowait = sum(c.iowait_debt for c in sorted_candidates)
-let cumulative = 0
-for each candidate c (in order):
-    cumulative += c.iowait_debt
-    c.cum_pct = cumulative / total_iowait * 100
-    c.pct_of_total = c.iowait_debt / total_iowait * 100
+total_weight = sum(branch.speed_weight for branch in branches)
+target[i] = branch[i].speed_weight / total_weight
 ```
 
-The 80% threshold is: the minimum set of top-ranked files whose cumulative
-iowait debt ≥ 80% of total iowait debt.
+Example: nvme(10) + ssd(4) + hdd(1) → targets: nvme=67%, ssd=27%, hdd=7%
 
-### 6.5 I/O Impact Projection
+### 6.5 Gap computation
+
+```
+actual[i] = branch[i].iowait / total_iowait
+gap[i] = target[i] - actual[i]
+```
+
+- `gap > 0`: branch has spare capacity — can receive files
+- `gap < 0`: branch is overloaded — can give away files
+- `gap == 0`: balanced
+
+### 6.6 Multi-tier move algorithm
+
+```
+1. Compute branch_stats and gaps
+2. Sort branches by gap ascending (most overloaded first)
+3. Identify source branches: those with gap < 0 AND speed class ≤ target tier
+4. Sort files on source branches by iowait_debt descending
+5. For each source branch (most overloaded first):
+     For each file on source branch (highest debt first):
+       Find target branch with largest positive gap
+       If target gap > 0:
+         Add file to move list
+         Update target gap (decrease by file's iowait contribution)
+       Else:
+         Break (no more capacity)
+```
+
+Default behavior: only source from the **lowest speed class** (e.g. HDD).
+This prevents unnecessary SSD→NVMe moves unless explicitly requested.
+
+### 6.7 I/O Impact Projection
 
 For each candidate:
 
 ```
 iowait_share_pct = c.iowait_debt / total_iowait * 100
-projected_improvement = iowait_share_pct  # if moved to fast branch
+improvement = c.iowait_debt * (1 - 1/speed_ratio)  # time saved by moving
 ```
 
-The "after" estimate: if these files are moved to the fast branch, their
-reads won't contribute to the slow branch's iowait. The net improvement
-is their share of total iowait. This is displayed as:
+Where `speed_ratio = target_weight / source_weight`.
+
+Display:
 
 ```
-Moving 187 files would eliminate 80.3% of read-associated I/O wait on the slow branch.
+Moving 187 files would eliminate 80.3% of read-associated I/O wait.
+Estimated time saved: 45.2s per observation session.
 ```
 
-This is not a wall-time guarantee — it says "this share of observed iowait
-was coincident with reads to these files."
-
-## 7. Selection Interface (selector.py)
+## 7. Selection Interface (collector.py, Rich TUI)
 
 ### 7.1 Display
 
-A single terminal table, not curses/rich — plain print with aligned columns.
+A full-screen Rich TUI using `Live(screen=True, get_renderable=)` at 1-2 Hz.
+Keyboard input on a separate daemon thread (own termios), isolated from Rich I/O.
+
+Two screens: **Monitor** (during observation) and **Candidate** (after observation).
+
+### 7.2 Monitor screen (during observation)
+
+Shows live-updating file table, process stats, and tier summary:
 
 ```
-=== dimergio — pool: GAMMAS (3m 14s observed) ===
-
-Branches:
-  ssd_branch   943G / 712G free   dm-7  {rotational: 0}
-  hdd_branch    15T / 4.5T free   dm-3  {rotational: 1}
-
-Read events on slow branch(es): 45,832
-
-Rank metric: [I]owait debt  [R]eads  [D]ensity
-
-  #  Reads  %R    IOWait  %IO    Cum%IO   Size    Branch    File
-─── ────── ───── ──────── ────── ──────── ─────── ───────── ────────────────
-  1  4,521  9.9%  22.6     9.1%   9.1%   12.5MB   hdd_branch Data/textures/...
-  2  3,892  8.5%  19.5     7.9%  17.0%   438MB    hdd_branch Data/meshes/...
-  3  2,891  6.3%  14.5     5.8%  22.8%   2.1GB    hdd_branch Data/main.ba2
-  …
- 38  1,204  2.6%   6.0     2.4%  80.3%   891MB    hdd_branch Data/terrain/...
-─── ────── ───── ──────── ────── ────────
-     45,832       248.4
-
-80% IOWait threshold: 38 files (cumulative 80.3%, 248.4 unit IOWait)
+╭─ dimergio — <pool> ─────────────────────────────────────────────────────────────────────────────────────╮
+│ 0:05:32  reads 4,812  writes 17  files 87  iowait 25.3(18.1)s  active 2  sample 10ms(100Hz)              │
+│ Tiers:  0:nvme(10x)  1:ssd(4x)  2:r1(1x)   [a] auto-quit:OFF  [M] nand:OFF                            │
+│ Watching:  /mnt/@/ssd_games  /mnt/@/r1_games                                                              │
+├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ PROCESS              READS  WRITES  IOWAIT  STATUS                                                       │
+│ everspace2.exe        3,923      12  12.348  run                                                          │
+│ wineserver              877       0   2.104  run                                                          │
+│ signal-desktop           12       5   0.032  run                                                          │
+├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ # READS   IOWAIT    SIZE   BRANCH  FILE                                                                  │
+│ 1 4,521  22.600  12.5MB   ssd     Data/textures/grass.dds                                                │
+│ 2 3,892  19.500   438MB   r1      Data/meshes/rock.nif                                                   │
+│ 3 2,891  14.500  2.1GB    r1      Data/main.ba2                                                          │
+│ 4 2,100   8.200  128MB    ssd     Data/sounds/music.pak                                                  │
+│ 5 1,800   7.100   64MB    r1      Data/shaders/compiled.glsl                                              │
+├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Tier: reads  nvme    0 (0%)  ssd 2,400 (50%)  r1 2,412 (50%)                                              │
+│       iowait  nvme 0.0s(0%)  ssd  7.2s(28%)  r1 18.1s(72%)                                              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-### 7.2 User actions
+Read-only during monitoring. No actions, no selection. Press `q` to stop and
+switch to Candidate screen. Press `a` to toggle auto-quit. Press `M` to toggle
+nand source warning.
+
+If terminal has too few rows (< 3 processes, < 5 files), display a warning
+and suggest the user wait longer or check `--sudo`.
+
+### 7.3 Candidate screen (after observation)
+
+Shows the full analysis with selection:
 
 ```
-Rank metric: [I]owait debt  [R]eads  [D]ensity  [current: I]
->
+╭─ dimergio — candidate files ─────────────────────────────────────────────────────────────────────────────╮
+│ 0:05:32  reads 4,812  writes 17  iowait 25.3(18.1)s                                                     │
+├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Tier: reads  nvme    0 (0%)  ssd 2,400 (50%)  r1 2,412 (50%)                                              │
+│       iowait  nvme 0.0s(0%)  ssd  7.2s(28%)  r1 18.1s(72%)  gap  +27%  -1%  -26%                       │
+├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ # READS   IOWAIT    SIZE  WRITES  BRANCH  FILE                                                           │
+│ 1 4,521  22.600  12.5MB       0   r1     Data/textures/grass.dds                                         │
+│ 2 3,892  19.500   438MB       0   r1     Data/meshes/rock.nif                                            │
+│ 3 2,891  14.500  2.1GB        3   r1     Data/main.ba2                                                   │
+│ 4 2,100   8.200  128MB        0   ssd    Data/sounds/music.pak                                            │
+│ 5 1,800   7.100   64MB        0   r1     Data/shaders/compiled.glsl                                       │
+├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Enter file number to move, range (e.g. 1-5), or 'all'. Press 'q' to quit.                                │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-User enters:
-- A number: move top N files
-- `I`, `R`, or `D`: switch ranking metric and redisplay
-- `q`: quit without moving
+### 7.4 User actions
+
+- **Number**: select a file by row number
+- **Range**: e.g. `1-5` selects files 1 through 5
+- **`all`**: select all candidates
+- **`m`**: move selected files (triggers NAND source warning if applicable)
+- **`q`**: quit without moving
+- **`[`**: decrease sample interval by 5ms (faster, min 5ms)
+- **`]`**: increase sample interval by 5ms (slower)
+
+### 7.5 NAND source warning
+
+Any move from a NAND source (SSD or NVMe) triggers a confirmation:
 
 ```
-> 38
-Move top 38 files (80.3% of IOWait, ~1.8GB to copy). Continue? [Y/n]:
+⚠ Source is NAND: /mnt/@/ssd_games/Data/textures/grass.dds
+  Moving SSD→NVMe may reduce NAND lifespan.
+  Confirm move? [y/N]
 ```
 
-### 7.3 Behavior
+Uses Rich `Confirm.ask()` which pauses the TUI, shows the warning, and waits
+for y/N input.
 
-- After selection, the caller (cli.py `watch` or `analyze`) passes the
-  selected file list to mover.py
-- The display function is stateless — it takes a list of Candidate and
-  a pool reference, prints, and returns a selection
+### 7.6 Rich markup and highlighting
+
+- `Table.add_row(..., style="bold")` for highlighted rows
+- Rich markup like `[bold red]`, `[dim]`, `[reverse]` for inline styling
+- `style` kwarg on individual cells for per-column coloring
+- `row_styles` for alternating row backgrounds
 
 ## 8. Migration (mover.py)
 
@@ -513,49 +615,55 @@ loaded and new data is merged.
 ## 10. CLI Reference (cli.py)
 
 ```
-usage: dimergio <command> [options]
+usage: dimergio [options]
 
-commands:
-  watch         Run fatrace, collect, analyze, and move files
-  analyze       Analyze existing fatrace log without live collection
-  status        Show migration state for a pool
-  cleanup       Ask about old migrations, delete originals or undo
-  undo          Restore originals and remove copies
-
-watch options:
-  --pool PATH   Mergerfs pool mount point  [default: /mnt/games]
-  --data PATH   Restrict to reads under this path (default: CWD inside pool, else pool root)
+options:
+  --pool PATH     Mergerfs pool mount point  [default: /mnt/games]
+  --data PATH     Restrict to reads under this path (default: CWD inside pool, else pool root)
   --process NAME  Auto-quit when this process exits (matches /proc/<pid>/cmdline)
-  --pid N       Auto-quit when this PID exits
-  --sudo        Run fatrace via sudo (needs CAP_SYS_ADMIN for fanotify)
+  --pid N         Auto-quit when this PID exits
+  --sudo          Run fatrace via sudo (needs CAP_SYS_ADMIN for fanotify)
   --no-interactive  Disable interactive PID monitor (headless mode)
-
-analyze options:
-  --log PATH    Path to existing fatrace log file
-  --pool PATH   Pool mount point  [default: /mnt/games]
-  --data PATH   Restrict to reads under PATH  [default: pool root]
-  --iowait PATH  Path to iowait sample log (if collected separately)
-
-status options:
-  --pool PATH   Pool to query  [default: /mnt/games]
-
-cleanup options:
-  --pool PATH   Pool to clean up  [default: /mnt/games]
-  --all         Process all pending, not just those past threshold
-
-undo options:
-  --pool PATH   Pool to undo moves in  [default: /mnt/games]
-  --all         Undo all migrations for this pool
+  --verbose, -v   Log raw fatrace lines + parsing decisions to stderr
+  --auto-quit     Enable auto-quit in interactive mode (default: OFF)
+  --version       Show version and exit
 ```
 
-### 10.1 analyze subcommand (offline mode)
+### 10.1 Flag details
 
-Read a previously-saved fatrace log. Requires a companion iowait sample log
-for I/O debt correlation (optional — without it, ranking falls back to read
-count).
+**`--pool PATH`**: Root of the mergerfs pool. The tool discovers all branches
+from the mergerfs mount options. Default: `/mnt/games`.
 
-If the log was collected by dimergio (checkpoint available), load the
-accumulated data directly.
+**`--data PATH`**: Restrict observation to reads under this path. If not given,
+defaults to CWD if inside the pool, else the pool root.
+
+**`--process NAME`**: Monitor a specific process. In passive mode (no TUI),
+auto-quit when no events from NAME arrive in 30 seconds. In interactive mode,
+auto-quit is ON by default.
+
+**`--pid N`**: Monitor a specific PID. Auto-quit when the PID disappears.
+
+**`--sudo`**: Run fatrace via sudo (needed for CAP_SYS_ADMIN). Skips UID
+filtering. Requires `sudo-rs` or standard sudo with cached credentials.
+
+**`--no-interactive`**: Headless mode. No TUI. Outputs periodic status to
+stderr. Used for scripting or piping.
+
+**`--verbose` / `-v`**: Logs every raw fatrace line and parsing decision
+to stderr. Useful for debugging path resolution and event filtering.
+
+**`--auto-quit`**: Explicitly enable auto-quit in interactive mode. Useful
+for scripts or when you want the TUI to stop automatically after the target
+process exits.
+
+**`--version`**: Print `dimergio 0.1.1` and exit.
+
+### 10.2 Path resolution
+
+The tool automatically discovers pool branches from the mergerfs mount. Fatrace
+runs against the raw btrfs volume mounts (not the FUSE mount), and paths are
+remapped to pool-relative via the volume map. This handles symlinks, bind mounts,
+and mergerfs mount aliases transparently.
 
 ## 11. Configuration (config.py)
 
@@ -582,6 +690,9 @@ Created on first run with defaults if absent.
 - `timezone.utc` for timestamps
 - `@dataclass(slots=True)` for model objects (3.10)
 - `|` union types in annotations (3.10)
+- `Rich` for TUI: `Live`, `Table`, `Panel`, `Console`, `Prompt`, `Confirm`
+- `threading.Thread(daemon=True)` for keyboard reader and iowait sampler
+- `termios`/`tty` for raw keyboard input (isolated from Rich I/O)
 
 ## 13. Non-goals
 
@@ -591,3 +702,5 @@ Created on first run with defaults if absent.
 - No automatic migration without user confirmation
 - No support for mergerfs pools the tool did not discover at startup
 - No file integrity verification beyond size comparison (optional SHA256 with --verify)
+- No byte-range tracking (fatrace does not output byte counts)
+- No actions during monitoring — TUI is read-only during observation

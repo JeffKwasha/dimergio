@@ -11,10 +11,21 @@ class Branch:
     rotational: bool      # True = HDD, False = SSD/NVMe
     total_bytes: int = 0
     free_bytes: int = 0
+    speed_class: str = "hdd"   # "nvme", "ssd", or "hdd"
+    speed_weight: int = 1      # relative throughput: hdd=1, ssd=4, nvme=10
 
     @property
     def label(self) -> str:
         return self.path.name
+
+    @property
+    def short_label(self) -> str:
+        name = self.path.name
+        for suffix in ("_games", "_nvme", "_ssd", "_r1", "_r2"):
+            if name.endswith(suffix):
+                name = name[:-len(suffix)]
+                break
+        return name if name else self.path.name
 
     @property
     def device_stat_path(self) -> Path:
@@ -54,6 +65,7 @@ class FileAccumulator:
     path: Path
     branch_idx: int
     total_reads: int = 0
+    write_count: int = 0
     first_seen: float = 0.0
     last_seen: float = 0.0
     iowait_debt: float = 0.0
@@ -71,6 +83,7 @@ class PidStat:
     pid: int
     process_name: str
     read_count: int = 0
+    write_count: int = 0
     first_seen: float = 0.0
     last_seen: float = 0.0
     total_iowait_sec: float = 0.0

@@ -39,13 +39,25 @@ class IOWaitSampler:
     all events never exceeds wall-clock time.
     """
 
+    MIN_INTERVAL_MS = 5
+
     def __init__(self, branches: list[Branch], interval_ms: int = 10):
         self._branches = branches
+        self._interval_ms = interval_ms
         self._interval = interval_ms / 1000
         self._latest: dict[int, float] = {}
         self._event_counts: dict[int, int] = defaultdict(int)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    @property
+    def interval_ms(self) -> int:
+        return self._interval_ms
+
+    def set_interval_ms(self, ms: int) -> None:
+        ms = max(self.MIN_INTERVAL_MS, ms)
+        self._interval_ms = ms
+        self._interval = ms / 1000
 
     def record_event(self, branch_idx: int) -> None:
         self._event_counts[branch_idx] += 1
@@ -71,10 +83,8 @@ class IOWaitSampler:
             except (OSError, IndexError, ValueError):
                 prev[i] = 0
 
-        interval_s = self._interval
-
         while not self._stop.is_set():
-            time.sleep(interval_s)
+            self._stop.wait(self._interval)
 
             counts = {i: self._event_counts.pop(i, 0) for i in range(len(self._branches))}
 
@@ -323,6 +333,8 @@ class Collector:
         re_eval_at = start_time + 30
         show_exited = False
         selected_idx = 0
+        auto_quit = False
+        nand_warn = True
 
         def _fmt_duration(secs: float) -> str:
             m, s = divmod(int(secs), 60)
@@ -336,6 +348,7 @@ class Collector:
             n_active = sum(1 for s in self._pid_stats.values() if not s.exited)
             n_reads = self._pid_stats_total_reads()
             n_files = len(self._accumulators)
+            n_writes = len(self._written_paths)
 
             tracked = [s for s in self._pid_stats.values() if s.tracked]
             tracked_names = ", ".join(f"{s.process_name}({s.pid})" for s in tracked[:5])
@@ -366,70 +379,146 @@ class Collector:
                 if p not in self._written_paths
             )
             iowait_str = f"{total_iowait:.1f}" if ro_iowait == total_iowait else f"{total_iowait:.1f}({ro_iowait:.1f})"
-            header = Text(f"since {elapsed}  reads {n_reads:,}  files {n_files}  iowait {iowait_str}s  active {n_active}")
-
-            ranked = sorted(
-                self._pid_stats.values(),
-                key=lambda s: s.read_count,
-                reverse=True,
+            hz = 1000 / sampler.interval_ms
+            header = Text.from_markup(
+                f"[bold]since[/bold] {elapsed}  "
+                f"[bold]reads[/bold] {n_reads:,}  "
+                f"[bold]writes[/bold] {n_writes}  "
+                f"[bold]files[/bold] {n_files}  "
+                f"[bold]iowait[/bold] {iowait_str}s  "
+                f"[bold]active[/bold] {n_active}  "
+                f"[bold]sample[/bold] {sampler.interval_ms}ms({hz:.0f}Hz)"
             )
-            visible = [s for s in ranked if show_exited or not s.exited]
 
-            table = Table(
+            branches = self.pool.branches
+            tier_parts = []
+            for i, b in enumerate(branches):
+                tier_parts.append(f"{i}:{b.short_label}({b.speed_weight}x)")
+            tiers_line = Text.from_markup(
+                f"[bold]Tiers:[/bold]  {'  '.join(tier_parts)}   "
+                f"[dim]a:auto-quit:[/dim]{'ON' if auto_quit else 'OFF'}  "
+                f"[dim]M:nand:[/dim]{'ON' if nand_warn else 'OFF'}"
+            )
+
+            watching_parts = []
+            for b in branches:
+                watching_parts.append(str(b.path))
+            watching_line = Text.from_markup(
+                f"[bold]Watching:[/bold]  {'  '.join(watching_parts)}"
+            )
+
+            # --- Process table ---
+            proc_table = Table(
                 show_header=True,
                 header_style="bold",
                 box=_SIMPLE_BOX,
                 expand=True,
+                pad_edge=False,
             )
-            table.add_column("👁", justify="center", width=3, no_wrap=True)
-            table.add_column("PID", justify="right", width=7, no_wrap=True)
-            table.add_column("PROCESS", width=18, no_wrap=True)
-            table.add_column("READS", justify="right", width=10, no_wrap=True)
-            table.add_column("IOWAIT(s)", justify="right", width=10, no_wrap=True)
-            table.add_column("STATUS", width=7, no_wrap=True)
+            proc_table.add_column("PROCESS", width=18, no_wrap=True)
+            proc_table.add_column("READS", justify="right", width=10, no_wrap=True)
+            proc_table.add_column("WRITES", justify="right", width=10, no_wrap=True)
+            proc_table.add_column("IOWAIT(s)", justify="right", width=10, no_wrap=True)
+            proc_table.add_column("STATUS", width=7, no_wrap=True)
 
-            if not visible:
-                table.add_row("", "", "No reads collected yet.", "", "", "", style="dim")
+            ranked_pids = sorted(
+                self._pid_stats.values(),
+                key=lambda s: s.read_count,
+                reverse=True,
+            )
+            visible_pids = [s for s in ranked_pids if show_exited or not s.exited]
+
+            if not visible_pids:
+                proc_table.add_row("No reads collected yet.", "", "", "", "", style="dim")
             else:
-                for idx, s in enumerate(visible):
-                    eye = "👁" if s.tracked else " "
-                    cursor = "[reverse]▸[/reverse]" if idx == selected_idx else " "
+                for idx, s in enumerate(visible_pids[:10]):
                     name = s.process_name[:18]
                     reads = f"{s.read_count:,}"
                     iowait = f"{s.total_iowait_sec:.3f}"
                     if s.exited:
                         status = "[red]exited[/red]"
-                    else:
-                        status = "[green]run[/green]"
-
-                    if idx == selected_idx:
-                        row_style = "reverse"
                     elif s.tracked:
-                        row_style = "cyan"
+                        status = "[green]run[/green]"
                     else:
-                        row_style = ""
+                        status = "[dim]run[/dim]"
+                    proc_table.add_row(name, reads, str(s.write_count), iowait, status)
 
-                    table.add_row(
-                        f"{cursor}{eye}",
-                        str(s.pid),
-                        name,
-                        reads,
-                        iowait,
-                        status,
-                        style=row_style,
+            # --- File table ---
+            file_table = Table(
+                show_header=True,
+                header_style="bold",
+                box=_SIMPLE_BOX,
+                expand=True,
+                pad_edge=False,
+            )
+            file_table.add_column("#", justify="right", width=4, no_wrap=True)
+            file_table.add_column("READS", justify="right", width=10, no_wrap=True)
+            file_table.add_column("WRITES", justify="right", width=10, no_wrap=True)
+            file_table.add_column("IOWAIT", justify="right", width=10, no_wrap=True)
+            file_table.add_column("BRANCH", width=8, no_wrap=True)
+            file_table.add_column("FILE", no_wrap=True)
+
+            sorted_files = sorted(
+                self._accumulators.values(),
+                key=lambda a: a.iowait_debt,
+                reverse=True,
+            )
+            if not sorted_files:
+                file_table.add_row("", "", "", "", "", "No files tracked yet.", style="dim")
+            else:
+                for rank, acc in enumerate(sorted_files[:15], 1):
+                    br = branches[acc.branch_idx] if acc.branch_idx < len(branches) else branches[0]
+                    file_table.add_row(
+                        str(rank),
+                        f"{acc.total_reads:,}",
+                        str(acc.write_count),
+                        f"{acc.iowait_debt:.3f}",
+                        br.short_label,
+                        str(acc.path),
                     )
+
+            # --- Tier stats ---
+            tier_reads = [0] * len(branches)
+            tier_iowait = [0.0] * len(branches)
+            for acc in self._accumulators.values():
+                idx = acc.branch_idx if acc.branch_idx < len(branches) else 0
+                tier_reads[idx] += acc.total_reads
+                tier_iowait[idx] += acc.iowait_debt
+
+            total_r = sum(tier_reads) or 1
+            reads_parts = []
+            iowait_parts = []
+            for i, b in enumerate(branches):
+                pct = tier_reads[i] / total_r * 100
+                reads_parts.append(f"{b.short_label} {tier_reads[i]:,} ({pct:.0f}%)")
+            total_io = sum(tier_iowait) or 1.0
+            for i, b in enumerate(branches):
+                pct = tier_iowait[i] / total_io * 100
+                iowait_parts.append(f"{b.short_label} {tier_iowait[i]:.1f}s ({pct:.0f}%)")
+
+            tier_stats = Text.from_markup(
+                f"[bold]Tier reads:[/bold]  {'  '.join(reads_parts)}\n"
+                f"[bold]     iowait:[/bold]  {'  '.join(iowait_parts)}"
+            )
 
             status = Text(status_text, style=status_style) if status_text else ""
 
             return Panel(
+                Group(header, tiers_line, watching_line, proc_table, file_table, tier_stats, status),
+                title=f"dimergio — {self.pool.mount}",
+                subtitle="q:quit  ↑↓:select  Space:toggle  s:show-exited  []:sample-rate",
+                border_style="dim",
+            )
+
+            return Panel(
                 Group(header, table, status),
                 title=f"dimergio — {self.pool.mount}",
-                subtitle="q:quit  ↑↓:select  Space:toggle  s:show-exited",
+                subtitle="q:quit  ↑↓:select  Space:toggle  s:show-exited  []:sample-rate",
                 border_style="dim",
             )
 
         def _handle_key(key: str) -> bool:
-            nonlocal selected_idx, show_exited, quiesce_start, auto_detect_done
+            nonlocal selected_idx, show_exited, quiesce_start, auto_detect_done, auto_quit, nand_warn
             if key == "q":
                 return True
             elif key == "\x1b[A":
@@ -456,6 +545,14 @@ class Collector:
             elif key == "s":
                 show_exited = not show_exited
                 selected_idx = 0
+            elif key == "[":
+                sampler.set_interval_ms(sampler.interval_ms - 5)
+            elif key == "]":
+                sampler.set_interval_ms(sampler.interval_ms + 5)
+            elif key == "a":
+                auto_quit = not auto_quit
+            elif key == "M":
+                nand_warn = not nand_warn
             return False
 
         import termios
@@ -590,6 +687,27 @@ class Collector:
             self._written_paths.add(file_path)
             if self._verbose:
                 logger.info("  parse: W in event=%s → marked written: %s", event_type, file_path)
+            # Track write count for this PID
+            ts = float(m.group("ts"))
+            pid = int(m.group("pid"))
+            proc = m.group("proc")
+            s = self._ensure_pid_stat(pid, proc, ts)
+            s.write_count += 1
+            s.last_seen = ts
+            s.process_name = proc
+            # Track write count for this file
+            branch_idx = self._resolve_branch(file_path)
+            try:
+                acc = self._accumulators[file_path]
+            except KeyError:
+                acc = FileAccumulator(
+                    path=file_path,
+                    branch_idx=branch_idx,
+                    first_seen=ts,
+                )
+                self._accumulators[file_path] = acc
+            acc.write_count += 1
+            acc.last_seen = ts
 
         if event_type[0] != "R":
             return None
