@@ -69,6 +69,7 @@ class FileAccumulator:
     first_seen: float = 0.0
     last_seen: float = 0.0
     iowait_debt: float = 0.0
+    target_branch_idx: int | None = None  # marks intent for SELECT mode
 
     def observe(self, ts: float, iowait_sec: float) -> None:
         self.total_reads += 1
@@ -124,6 +125,13 @@ class MoveEntry:
     moved_at: str           # ISO-8601
     file_size: int
     verified_working: bool | None = None
+
+
+@dataclass(slots=True)
+class MovePlan:
+    file: FileAccumulator
+    target_branch_idx: int
+    is_rename_only: bool  # True if file was previously on target branch
 
 
 @dataclass(slots=True)

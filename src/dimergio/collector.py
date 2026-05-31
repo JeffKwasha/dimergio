@@ -135,6 +135,7 @@ class Collector:
         self._written_paths: set[Path] = set()
         self._verbose = verbose
         self.force_move = False
+        self.move_plans: list = []
         self._build_volume_map()
 
     def _build_volume_map(self) -> None:
@@ -332,10 +333,18 @@ class Collector:
         auto_detect_at = start_time + 3
         quiesce_start: float | None = None
         re_eval_at = start_time + 30
-        show_exited = False
-        selected_idx = 0
         auto_quit = False
         nand_warn = True
+
+        mode = "monitor"  # "monitor" or "select"
+        monitoring = True
+        file_scroll = 0
+        file_selected = 0
+        file_marks: dict[Path, int] = {}
+        confirm_quit = False
+        proc_box = [proc]
+
+        branches = self.pool.branches
 
         def _fmt_duration(secs: float) -> str:
             m, s = divmod(int(secs), 60)
@@ -344,7 +353,66 @@ class Collector:
                 return f"{h}:{m:02d}:{s:02d}"
             return f"{m:02d}:{s:02d}"
 
-        def _build_layout(now: float) -> Panel:
+        def _rel_path(path: Path) -> str:
+            try:
+                return str(path.relative_to(self.data_path))
+            except ValueError:
+                return path.name
+
+        def _branch_color(sc: str) -> str:
+            return {"hdd": "blue", "ssd": "teal", "nvme": "green"}.get(sc, "red")
+
+        def _sorted_files():
+            return sorted(
+                self._accumulators.values(),
+                key=lambda a: a.iowait_debt,
+                reverse=True,
+            )
+
+        def _visible_rows() -> int:
+            h = console.size.height
+            reserved = 18
+            return max(8, min(25, h - reserved))
+
+        def _on_multiple_branches(acc) -> bool:
+            from .state import StateManager
+            state = StateManager(self.pool.name)
+            rel = _rel_path(acc.path)
+            for e in state.all():
+                if e.pool_path == rel:
+                    return True
+            return False
+
+        def _calc_select_stats() -> tuple[float, float, dict[int, int]]:
+            total_saved = 0.0
+            total_time = 0.0
+            space: dict[int, int] = {}
+            for acc in _sorted_files():
+                tidx = file_marks.get(acc.path)
+                if tidx is None or tidx >= len(branches):
+                    continue
+                src_w = branches[acc.branch_idx].speed_weight
+                tgt_w = branches[tidx].speed_weight
+                total_saved += acc.iowait_debt * (1 - src_w / tgt_w)
+                try:
+                    sz = acc.path.stat().st_size
+                except OSError:
+                    sz = 0
+                total_time += sz / (tgt_w * 100_000_000)
+                space[tidx] = space.get(tidx, 0) + sz
+            return total_saved, total_time, space
+
+        def _fmt_bytes(b: int) -> str:
+            if b >= 1 << 30:
+                return f"{b / (1<<30):.1f}GB"
+            if b >= 1 << 20:
+                return f"{b / (1<<20):.0f}MB"
+            if b >= 1 << 10:
+                return f"{b / (1<<10):.0f}KB"
+            return f"{b}B"
+
+        # ─── MONITOR layout ─────────────────────────────────────────────
+        def _build_monitor(now: float) -> Panel:
             elapsed = _fmt_duration(now - start_time)
             n_active = sum(1 for s in self._pid_stats.values() if not s.exited)
             n_reads = self._pid_stats_total_reads()
@@ -358,14 +426,14 @@ class Collector:
             status_style = "dim"
             if not self._pid_stats:
                 if now - start_time > 3:
-                    status_text = "No reads detected — fatrace may need --sudo (fanotify requires CAP_SYS_ADMIN)"
+                    status_text = "No reads detected — fatrace may need --sudo"
                     status_style = "bold yellow"
                 else:
                     status_text = "Waiting for fatrace... (launch app in another terminal)"
             elif not auto_detect_done:
                 status_text = "Detecting active PIDs..."
             elif tracked and all(s.exited for s in tracked):
-                status_text = "All tracked PIDs exited — stopping."
+                status_text = "All tracked PIDs exited — press Space to review files."
             elif quiesce_start is not None:
                 rem = max(0, 30 - int(now - quiesce_start))
                 status_text = f"Quiescing {rem}s — Space to cancel"
@@ -373,10 +441,13 @@ class Collector:
             elif tracked_names:
                 status_text = f"tracking: {tracked_names}"
 
+            if not monitoring:
+                status_text = "Monitoring paused — press Space to resume, or scroll files below."
+                status_style = "bold cyan"
+
             total_iowait = sum(a.iowait_debt for a in self._accumulators.values())
             ro_iowait = sum(
-                a.iowait_debt
-                for p, a in self._accumulators.items()
+                a.iowait_debt for p, a in self._accumulators.items()
                 if p not in self._written_paths
             )
             iowait_str = f"{total_iowait:.1f}" if ro_iowait == total_iowait else f"{total_iowait:.1f}({ro_iowait:.1f})"
@@ -391,94 +462,57 @@ class Collector:
                 f"[bold]sample[/bold] {sampler.interval_ms}ms({hz:.0f}Hz)"
             )
 
-            branches = self.pool.branches
             tier_parts = []
             for i, b in enumerate(branches):
-                tier_parts.append(f"{i}:{b.short_label}({b.speed_weight}x)")
+                c = _branch_color(b.speed_class)
+                tier_parts.append(f"[{c}]{i}:{b.short_label}({b.speed_weight}x)[/{c}]")
             tiers_line = Text.from_markup(
                 f"[bold]Tiers:[/bold]  {'  '.join(tier_parts)}   "
                 f"[dim]a:auto-quit:[/dim]{'ON' if auto_quit else 'OFF'}  "
                 f"[dim]M:nand:[/dim]{'ON' if nand_warn else 'OFF'}"
             )
 
-            watching_parts = []
-            for b in branches:
-                watching_parts.append(str(b.path))
-            watching_line = Text.from_markup(
-                f"[bold]Watching:[/bold]  {'  '.join(watching_parts)}"
-            )
-
-            # --- Process table ---
-            proc_table = Table(
-                show_header=True,
-                header_style="bold",
-                box=_SIMPLE_BOX,
-                expand=True,
-                pad_edge=False,
-            )
+            proc_table = Table(show_header=True, header_style="bold", box=_SIMPLE_BOX, expand=True, pad_edge=False)
             proc_table.add_column("PROCESS", width=18, no_wrap=True)
             proc_table.add_column("READS", justify="right", width=10, no_wrap=True)
             proc_table.add_column("WRITES", justify="right", width=10, no_wrap=True)
             proc_table.add_column("IOWAIT(s)", justify="right", width=10, no_wrap=True)
             proc_table.add_column("STATUS", width=7, no_wrap=True)
 
-            ranked_pids = sorted(
-                self._pid_stats.values(),
-                key=lambda s: s.read_count,
-                reverse=True,
-            )
-            visible_pids = [s for s in ranked_pids if show_exited or not s.exited]
-
+            ranked_pids = sorted(self._pid_stats.values(), key=lambda s: s.read_count, reverse=True)
+            visible_pids = [s for s in ranked_pids if not s.exited]
             if not visible_pids:
                 proc_table.add_row("No reads collected yet.", "", "", "", "", style="dim")
             else:
-                for idx, s in enumerate(visible_pids[:10]):
-                    name = s.process_name[:18]
-                    reads = f"{s.read_count:,}"
-                    iowait = f"{s.total_iowait_sec:.3f}"
-                    if s.exited:
-                        status = "[red]exited[/red]"
-                    elif s.tracked:
-                        status = "[green]run[/green]"
-                    else:
-                        status = "[dim]run[/dim]"
-                    proc_table.add_row(name, reads, str(s.write_count), iowait, status)
+                for s in visible_pids[:10]:
+                    status = "[green]run[/green]" if not s.exited else "[red]exited[/red]"
+                    proc_table.add_row(s.process_name[:18], f"{s.read_count:,}", str(s.write_count), f"{s.total_iowait_sec:.3f}", status)
 
-            # --- File table ---
-            file_table = Table(
-                show_header=True,
-                header_style="bold",
-                box=_SIMPLE_BOX,
-                expand=True,
-                pad_edge=False,
-            )
+            max_vis = _visible_rows()
+            sorted_f = _sorted_files()
+            scroll_end = min(len(sorted_f), file_scroll + max_vis)
+            visible_files = sorted_f[file_scroll:scroll_end]
+
+            file_table = Table(show_header=True, header_style="bold", box=_SIMPLE_BOX, expand=True, pad_edge=False)
             file_table.add_column("#", justify="right", width=4, no_wrap=True)
             file_table.add_column("READS", justify="right", width=10, no_wrap=True)
-            file_table.add_column("WRITES", justify="right", width=10, no_wrap=True)
             file_table.add_column("IOWAIT", justify="right", width=10, no_wrap=True)
             file_table.add_column("BRANCH", width=8, no_wrap=True)
-            file_table.add_column("FILE", no_wrap=True)
+            file_table.add_column("FILE", no_wrap=True, ratio=1)
 
-            sorted_files = sorted(
-                self._accumulators.values(),
-                key=lambda a: a.iowait_debt,
-                reverse=True,
-            )
-            if not sorted_files:
-                file_table.add_row("", "", "", "", "", "No files tracked yet.", style="dim")
+            if not sorted_f:
+                file_table.add_row("", "", "", "", "No files tracked yet.", style="dim")
             else:
-                for rank, acc in enumerate(sorted_files[:15], 1):
+                for rank, acc in enumerate(visible_files, file_scroll + 1):
                     br = branches[acc.branch_idx] if acc.branch_idx < len(branches) else branches[0]
                     file_table.add_row(
                         str(rank),
                         f"{acc.total_reads:,}",
-                        str(acc.write_count),
                         f"{acc.iowait_debt:.3f}",
                         br.short_label,
-                        str(acc.path),
+                        _rel_path(acc.path),
                     )
 
-            # --- Tier stats ---
             tier_reads = [0] * len(branches)
             tier_iowait = [0.0] * len(branches)
             for acc in self._accumulators.values():
@@ -490,81 +524,258 @@ class Collector:
             reads_parts = []
             iowait_parts = []
             for i, b in enumerate(branches):
+                c = _branch_color(b.speed_class)
                 pct = tier_reads[i] / total_r * 100
-                reads_parts.append(f"{b.short_label} {tier_reads[i]:,} ({pct:.0f}%)")
+                reads_parts.append(f"[{c}]{b.short_label} {tier_reads[i]:,} ({pct:.0f}%)[/{c}]")
             total_io = sum(tier_iowait) or 1.0
             for i, b in enumerate(branches):
+                c = _branch_color(b.speed_class)
                 pct = tier_iowait[i] / total_io * 100
-                iowait_parts.append(f"{b.short_label} {tier_iowait[i]:.1f}s ({pct:.0f}%)")
+                iowait_parts.append(f"[{c}]{b.short_label} {tier_iowait[i]:.1f}s ({pct:.0f}%)[/{c}]")
 
             tier_stats = Text.from_markup(
                 f"[bold]Tier reads:[/bold]  {'  '.join(reads_parts)}\n"
                 f"[bold]     iowait:[/bold]  {'  '.join(iowait_parts)}"
             )
 
-            # Check if all files are on the same tier (no moves possible)
-            active_tiers = sum(1 for r in tier_reads if r > 0)
-            if active_tiers <= 1 and n_files > 0:
-                tier_stats.append("\n")
-                tier_stats.append("[bold yellow]⚠ All files on same tier — no upgrades available.[/bold yellow]", style="bold yellow")
-                tier_stats.append("\n")
-                tier_stats.append("[dim]Press 'f' to force-move files (downgrade).[/dim]", style="dim")
-
             status = Text(status_text, style=status_style) if status_text else ""
+            sub = "Space:stop/resume  q:quit  s:show-exited  []:sample-rate  a:auto-quit  Enter:review files"
 
             return Panel(
-                Group(header, tiers_line, watching_line, proc_table, file_table, tier_stats, status),
-                title=f"dimergio — {self.pool.mount}",
-                subtitle="q:quit  ↑↓:select  s:show-exited  []:sample-rate  f:force-move",
+                Group(header, tiers_line, proc_table, file_table, tier_stats, status),
+                title=f"dimergio — {self.pool.mount}  [bold cyan]MONITOR[/bold cyan]",
+                subtitle=sub,
                 border_style="dim",
             )
 
+        # ─── SELECT layout ──────────────────────────────────────────────
+        def _build_select(now: float) -> Panel:
+            n_files = len(self._accumulators)
+            n_marked = len(file_marks)
+            est_saved, est_time, space_req = _calc_select_stats()
+
+            header = Text.from_markup(
+                f"[bold]files[/bold] {n_files}  "
+                f"[bold]marked[/bold] {n_marked}  "
+                f"[bold]est. iowait saved[/bold] {est_saved:.1f}s  "
+                f"[bold]est. move time[/bold] {est_time:.1f}s"
+            )
+
+            sorted_f = _sorted_files()
+            max_vis = _visible_rows()
+            scroll_end = min(len(sorted_f), file_scroll + max_vis)
+            visible_files = sorted_f[file_scroll:scroll_end]
+
+            file_table = Table(show_header=True, header_style="bold", box=_SIMPLE_BOX, expand=True, pad_edge=False)
+            file_table.add_column("#", justify="right", width=4, no_wrap=True)
+            file_table.add_column("READS", justify="right", width=10, no_wrap=True)
+            file_table.add_column("IOWAIT", justify="right", width=10, no_wrap=True)
+            file_table.add_column("FROM", width=8, no_wrap=True)
+            file_table.add_column("TO", width=8, no_wrap=True)
+            file_table.add_column("FILE", no_wrap=True, ratio=1)
+
+            if not sorted_f:
+                file_table.add_row("", "", "", "", "", "No files tracked.", style="dim")
+            else:
+                for rank, acc in enumerate(visible_files, file_scroll + 1):
+                    br = branches[acc.branch_idx] if acc.branch_idx < len(branches) else branches[0]
+                    from_label = br.short_label
+                    if _on_multiple_branches(acc):
+                        from_label += "\u2026"
+                    from_c = _branch_color(br.speed_class)
+
+                    tidx = file_marks.get(acc.path)
+                    if tidx is not None and tidx < len(branches):
+                        tgt = branches[tidx]
+                        to_label = tgt.short_label
+                        to_c = _branch_color(tgt.speed_class)
+                        to_cell = f"[{to_c}]{to_label}[/{to_c}]"
+                    else:
+                        to_cell = "[dim]-[/dim]"
+
+                    is_selected = (file_scroll + (rank - file_scroll - 1) == file_selected) if visible_files else False
+                    row_style = "reverse" if (rank - 1 == file_selected) else ""
+
+                    file_table.add_row(
+                        str(rank),
+                        f"{acc.total_reads:,}",
+                        f"{acc.iowait_debt:.3f}",
+                        f"[{from_c}]{from_label}[/{from_c}]",
+                        to_cell,
+                        _rel_path(acc.path),
+                        style=row_style,
+                    )
+
+            legend_parts = []
+            for i, b in enumerate(branches):
+                c = _branch_color(b.speed_class)
+                legend_parts.append(f"[{c}]{i}:{b.short_label}({b.speed_weight}x)[/{c}]")
+            legend = Text.from_markup(f"[bold]Branches:[/bold]  {'  '.join(legend_parts)}")
+
+            space_parts = []
+            for i, b in enumerate(branches):
+                c = _branch_color(b.speed_class)
+                sz = space_req.get(i, 0)
+                space_parts.append(f"[{c}]{b.short_label} {_fmt_bytes(sz)}[/{c}]")
+            space_line = Text.from_markup(f"[bold]Space required:[/bold]  {'  '.join(space_parts)}")
+
+            if confirm_quit:
+                status = Text("Quit without moving? Press Y to confirm, any other key to cancel.", style="bold yellow")
+            else:
+                status = Text("↑↓:scroll  0-9:mark branch  Shift+0-9:mark above  -:clear  Enter:move  q:quit", style="dim")
+
+            return Panel(
+                Group(header, file_table, legend, space_line, status),
+                title=f"dimergio — {self.pool.mount}  [bold green]SELECT[/bold green]",
+                subtitle="↑↓:scroll  PgUp/PgDn/Home/End  0-9:mark  Enter:move  q:quit",
+                border_style="dim",
+            )
+
+        # ─── Key handling ───────────────────────────────────────────────
+        _SHIFT_MAP = {")": 0, "!": 1, "@": 2, "#": 3, "$": 4, "%": 5, "^": 6, "&": 7, "*": 8, "(": 9}
+
         def _handle_key(key: str) -> bool:
-            nonlocal selected_idx, show_exited, quiesce_start, auto_detect_done, auto_quit, nand_warn
+            nonlocal mode, monitoring, file_scroll, file_selected, confirm_quit
+            nonlocal auto_quit, nand_warn, quiesce_start, auto_detect_done
+
+            if confirm_quit:
+                if key in ("y", "Y", "\r", "\n"):
+                    return True
+                confirm_quit = False
+                return False
+
+            if mode == "monitor":
+                return _handle_monitor_key(key)
+            else:
+                return _handle_select_key(key)
+
+        def _handle_monitor_key(key: str) -> bool:
+            nonlocal mode, monitoring, auto_quit, nand_warn
+
             if key == "q":
                 return True
-            elif key == "\x1b[A":
-                selected_idx = max(0, selected_idx - 1)
-            elif key == "\x1b[B":
-                ranked = sorted(
-                    self._pid_stats.values(),
-                    key=lambda s: s.read_count,
-                    reverse=True,
-                )
-                visible = [s for s in ranked if show_exited or not s.exited]
-                selected_idx = min(len(visible) - 1, selected_idx + 1) if visible else 0
             elif key == " ":
-                ranked = sorted(
-                    self._pid_stats.values(),
-                    key=lambda s: s.read_count,
-                    reverse=True,
-                )
-                visible = [s for s in ranked if show_exited or not s.exited]
-                if 0 <= selected_idx < len(visible):
-                    visible[selected_idx].tracked = not visible[selected_idx].tracked
-                    auto_detect_done = True
-                    quiesce_start = None
+                if monitoring:
+                    monitoring = False
+                    proc_box[0].terminate()
+                    proc_box[0].wait()
+                    read_thread.join(timeout=5)
+                    sampler.stop()
+                    mode = "select"
+                else:
+                    monitoring = True
+                    sampler.start()
+                    cmd = ["/usr/sbin/fatrace", "-f", "RW", "-u", "-t", "-t"]
+                    if self.use_sudo:
+                        cmd = ["sudo"] + cmd
+                    proc_box[0] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=str(self.pool.mount))
+                    assert proc_box[0].stdout is not None
+                return False
+            elif key == "\x1b[A":
+                pass
+            elif key == "\x1b[B":
+                pass
             elif key == "s":
-                show_exited = not show_exited
-                selected_idx = 0
+                pass
             elif key == "[":
                 sampler.set_interval_ms(sampler.interval_ms - 5)
             elif key == "]":
                 sampler.set_interval_ms(sampler.interval_ms + 5)
             elif key == "a":
                 auto_quit = not auto_quit
+                if auto_quit and self._pid_stats:
+                    self._auto_detect_tracked()
+                    auto_detect_done = True
             elif key == "M":
                 nand_warn = not nand_warn
-            elif key == "f":
-                self.force_move = True
+            elif key == "\r" or key == "\n":
+                if monitoring:
+                    monitoring = False
+                    proc.terminate()
+                    proc.wait()
+                    read_thread.join(timeout=5)
+                    sampler.stop()
+                mode = "select"
+            return False
+
+        def _handle_select_key(key: str) -> bool:
+            nonlocal mode, monitoring, file_scroll, file_selected, confirm_quit
+            sorted_f = _sorted_files()
+            max_vis = _visible_rows()
+
+            if key == "q":
+                if file_marks:
+                    confirm_quit = True
+                else:
+                    return True
+            elif key == " ":
+                mode = "monitor"
+                monitoring = True
+                sampler.start()
+                cmd = ["/usr/sbin/fatrace", "-f", "RW", "-u", "-t", "-t"]
+                if self.use_sudo:
+                    cmd = ["sudo"] + cmd
+                proc_box[0] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=str(self.pool.mount))
+                assert proc_box[0].stdout is not None
+            elif key == "\x1b[A":
+                file_selected = max(0, file_selected - 1)
+                if file_selected < file_scroll:
+                    file_scroll = file_selected
+            elif key == "\x1b[B":
+                file_selected = min(len(sorted_f) - 1, file_selected + 1)
+                if file_selected >= file_scroll + max_vis:
+                    file_scroll = file_selected - max_vis + 1
+            elif key == "\x1b[5~":
+                file_scroll = max(0, file_scroll - max_vis)
+                file_selected = min(file_selected, file_scroll)
+            elif key == "\x1b[6~":
+                file_scroll = min(max(0, len(sorted_f) - max_vis), file_scroll + max_vis)
+                file_selected = max(file_selected, file_scroll)
+            elif key == "\x1b[H":
+                file_scroll = 0
+                file_selected = 0
+            elif key == "\x1b[F":
+                file_selected = max(0, len(sorted_f) - 1)
+                file_scroll = max(0, len(sorted_f) - max_vis)
+            elif key in _SHIFT_MAP:
+                br_idx = _SHIFT_MAP[key]
+                if br_idx < len(branches) and file_selected < len(sorted_f):
+                    for i in range(file_selected + 1):
+                        acc = sorted_f[i]
+                        if acc.write_count == 0:
+                            file_marks[acc.path] = br_idx
+            elif key.isdigit():
+                br_idx = int(key)
+                if br_idx < len(branches) and file_selected < len(sorted_f):
+                    acc = sorted_f[file_selected]
+                    if file_marks.get(acc.path) == br_idx:
+                        del file_marks[acc.path]
+                    else:
+                        file_marks[acc.path] = br_idx
+            elif key == "-":
+                if file_selected < len(sorted_f):
+                    acc = sorted_f[file_selected]
+                    file_marks.pop(acc.path, None)
+            elif key == "\r" or key == "\n":
+                self.move_plans = []
+                for acc in sorted_f:
+                    tidx = file_marks.get(acc.path)
+                    if tidx is None or tidx >= len(branches):
+                        continue
+                    from .model import MovePlan
+                    self.move_plans.append(MovePlan(
+                        file=acc,
+                        target_branch_idx=tidx,
+                        is_rename_only=False,
+                    ))
                 return True
             return False
 
-        import termios
+        # ─── Keyboard reader thread ─────────────────────────────────────
+        import termios, queue
 
         fd = sys.stdin.fileno()
         old_attr = termios.tcgetattr(fd)
-        # Single-key input: disable line buffering, echo, signal keys
         raw_attr = list(old_attr)
         raw_attr[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG | termios.IEXTEN)
         raw_attr[0] &= ~(termios.ICRNL | termios.IXON)
@@ -583,9 +794,6 @@ class Collector:
                     return None
             return None
 
-        # Run the input reader on its own thread with raw termios so
-        # Rich's output (main thread / auto-refresh) is never affected.
-        import queue
         _key_q: queue.SimpleQueue[str | None] = queue.SimpleQueue()
         _stop_reader = threading.Event()
 
@@ -601,15 +809,13 @@ class Collector:
         t.start()
 
         def _get_layout() -> Panel:
-            return _build_layout(time.time())
+            now = time.time()
+            if mode == "monitor":
+                return _build_monitor(now)
+            return _build_select(now)
 
-        with Live(
-            console=console,
-            screen=True,
-            refresh_per_second=4,
-            get_renderable=_get_layout,
-        ) as live:
-            try:
+        try:
+            with Live(console=console, screen=True, refresh_per_second=4, get_renderable=_get_layout) as live:
                 while not self._stop_flag.is_set():
                     now = time.time()
 
@@ -620,27 +826,32 @@ class Collector:
                     if key and _handle_key(key):
                         break
 
-                    if not auto_detect_done and now >= auto_detect_at and self._pid_stats:
-                        self._auto_detect_tracked()
-                        auto_detect_done = True
+                    if mode == "monitor" and monitoring:
+                        if not auto_detect_done and now >= auto_detect_at and self._pid_stats:
+                            self._auto_detect_tracked()
+                            auto_detect_done = True
 
-                    if auto_detect_done and now >= re_eval_at:
-                        self._auto_detect_tracked()
-                        re_eval_at = now + 30
+                        if auto_detect_done and now >= re_eval_at:
+                            self._auto_detect_tracked()
+                            re_eval_at = now + 30
 
-                    if self._check_tracked_exited():
-                        if quiesce_start is None:
-                            quiesce_start = now
-                        elif now - quiesce_start >= 30:
-                            break
-                    else:
-                        if quiesce_start is not None:
-                            quiesce_start = None
+                        if auto_quit and self._check_tracked_exited():
+                            if quiesce_start is None:
+                                quiesce_start = now
+                            elif now - quiesce_start >= 30:
+                                break
+                        else:
+                            if quiesce_start is not None:
+                                quiesce_start = None
+        finally:
+            _stop_reader.set()
+            t.join(timeout=2)
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
 
-            finally:
-                _stop_reader.set()
-                t.join(timeout=2)
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+        from .stats import load_stats, merge_stats, save_stats
+        existing = load_stats(self.pool)
+        merged = merge_stats(existing, self._accumulators, self.data_path)
+        save_stats(self.pool, merged)
 
     def _remap_volume_path(self, path: Path) -> Path | None:
         """Convert a raw btrfs volume path to a pool-relative path.

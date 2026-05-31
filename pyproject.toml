@@ -5,6 +5,7 @@ description = "Smart file redistribution for mergerfs pools based on read observ
 requires-python = ">=3.10"
 dependencies = [
     "rich>=13.0",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
