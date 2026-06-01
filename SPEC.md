@@ -28,15 +28,21 @@ benchmarking is performed. No assumptions are made about hardware latency.
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                       dimergio CLI                           │
-│  dimergio --pool /mnt/games --pid 12345 --sudo              │
+│  dimergio watch --pool /mnt/games --pid 12345 --sudo        │
 └─────────────────────────────────────────────────────────────┘
          │
          ├── __init__.py      Package version (0.1.1)
          ├── __main__.py      Entry point (python -m dimergio), logging config
          ├── pool.py          Mergerfs discovery from /proc, branch speed class auto-detection
-         ├── collector.py     fatrace subprocess, IOWait sampling, Rich TUI, process tracking
-         └── model.py         Data classes (Pool, Branch, ReadEvent, FileAccumulator,
-                               PidStat, Candidate) and analysis logic
+         ├── collector.py     fatrace subprocess, IOWait sampling, Rich TUI (MONITOR + SELECT modes),
+         │                    process tracking, branch marking, file selection
+         ├── model.py         Data classes (Pool, Branch, ReadEvent, FileAccumulator,
+         │                    PidStat, Candidate, MovePlan, MoveEntry)
+         ├── analyze.py       Multi-tier move algorithm, gap computation
+         ├── mover.py         Smart rename, copy, execute_move_plan()
+         ├── state.py         StateManager (MoveEntry tracking, checkpoints)
+         ├── stats.py         YAML persistence (.dimergio.yaml on largest branch)
+         └── config.py        User configuration
 ```
 
 ### 3.1 Data Flow
@@ -54,8 +60,23 @@ collector._parse_line()          ─── ReadEvent(timestamp, proc, pid, uid, 
     │                                  FileAccumulator.write_count++   (W events)
     │                                  FileAccumulator.iowait_debt += iowait_sec
     │
-    └── collector._update_pid_stats() ── PidStat.read_count++, pid_iowait_sec[pid] += iowait_sec
-                                          PidStat.write_count++ on W events
+    ├── collector._update_pid_stats() ── PidStat.read_count++, pid_iowait_sec[pid] += iowait_sec
+    │                                    PidStat.write_count++ on W events
+    │
+    └── TUI (MONITOR mode) ────── Read-only observation: process table, file table, tier stats
+                                    │
+                                    ├── Space ──── Stop monitoring → SELECT mode
+                                    └── Enter ──── Switch to SELECT mode
+
+SELECT mode ────────────────────── File selection with branch targeting
+    │
+    ├── 0-9 ────── Mark file's target branch
+    ├── Shift+0-9  Mark all files above (higher iowait) → skip files with writes
+    ├── - ──────── Clear mark
+    ├── Enter ──── Confirm moves → execute_move_plan()
+    ├── q ──────── Quit (confirmation if files marked)
+    ├── PageUp/Down/Home/End ── Scroll
+    └── Space ──── Back to MONITOR mode (restarts fatrace)
 ```
 
 ## 4. Pool Discovery (pool.py)
@@ -362,24 +383,25 @@ Moving 187 files would eliminate 80.3% of read-associated I/O wait.
 Estimated time saved: 45.2s per observation session.
 ```
 
-## 7. Selection Interface (collector.py, Rich TUI)
+## 7. TUI Interface (collector.py, Rich TUI)
 
 ### 7.1 Display
 
 A full-screen Rich TUI using `Live(screen=True, get_renderable=)` at 1-2 Hz.
 Keyboard input on a separate daemon thread (own termios), isolated from Rich I/O.
 
-Two screens: **Monitor** (during observation) and **Candidate** (after observation).
+Two modes: **MONITOR** (during observation) and **SELECT** (after observation).
 
-### 7.2 Monitor screen (during observation)
+### 7.2 MONITOR mode (during observation)
 
 Shows live-updating file table, process stats, and tier summary:
 
 ```
-╭─ dimergio — <pool> ─────────────────────────────────────────────────────────────────────────────────────╮
-│ 0:05:32  reads 4,812  writes 17  files 87  iowait 25.3(18.1)s  active 2  sample 10ms(100Hz)              │
-│ Tiers:  0:nvme(10x)  1:ssd(4x)  2:r1(1x)   [a] auto-quit:OFF  [M] nand:OFF                            │
-│ Watching:  /mnt/@/ssd_games  /mnt/@/r1_games                                                              │
+╭─ dimergio — <pool> — MONITOR ───────────────────────────────────────────────────────────────────────────╮
+│ 0:05:32  reads 4,812  writes 17  files 87  iowait 25.3(18.1)s  active 2  sample 10ms(100Hz)            │
+│ Tiers:  nvme=10x(ssd)  ssd=4x(ssd)  r1=1x(hdd)  total(ro) 25.3s                                       │
+│ Watching: /mnt/@/ssd_games /mnt/@/r1_games                                                              │
+│ [a] auto-quit:OFF  [Space] stop & select  [Enter] select  [q] quit                                      │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ PROCESS              READS  WRITES  IOWAIT  STATUS                                                       │
 │ everspace2.exe        3,923      12  12.348  run                                                          │
@@ -398,80 +420,108 @@ Shows live-updating file table, process stats, and tier summary:
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-Read-only during monitoring. No actions, no selection. Press `q` to stop and
-switch to Candidate screen. Press `a` to toggle auto-quit. Press `M` to toggle
-nand source warning.
+Read-only during monitoring. No actions, no selection. Press `q` to quit (with
+confirmation). Press `Space` or `Enter` to stop monitoring and switch to SELECT mode.
 
-If terminal has too few rows (< 3 processes, < 5 files), display a warning
-and suggest the user wait longer or check `--sudo`.
+### 7.3 SELECT mode (after observation)
 
-### 7.3 Candidate screen (after observation)
-
-Shows the full analysis with selection:
+File selection with branch targeting. Each file gets a FROM (current) and TO (target) column.
+Color-coded by speed class: blue=HDD, teal=SSD, green=NVMe.
 
 ```
-╭─ dimergio — candidate files ─────────────────────────────────────────────────────────────────────────────╮
-│ 0:05:32  reads 4,812  writes 17  iowait 25.3(18.1)s                                                     │
+╭─ dimergio — <pool> — SELECT ────────────────────────────────────────────────────────────────────────────╮
+│ 0:05:32  reads 4,812  writes 17  files 87  iowait 25.3(18.1)s  active 2                                │
+│ Est. iowait: 25.3s  Move time: ~2.1s  Space required: 0B                                               │
+│ Tiers:  nvme=10x(ssd)  ssd=4x(ssd)  r1=1x(hdd)  total(ro) 25.3s                                       │
+│ [Space] monitor  [Enter] confirm  [q] quit  [0-9] mark  [Shift+0-9] mark above                          │
+├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ # FROM        TO     WRITES  IOWAIT    SIZE  FILE                                                        │
+│ 1  ssd   ──→  nvme       0  22.600  12.5MB  Data/textures/grass.dds                                      │
+│ 2  r1    ──→  ssd        0  19.500   438MB  Data/meshes/rock.nif                                         │
+│ 3  r1    ──→  ssd        3  14.500  2.1GB  Data/main.ba2                                                 │
+│ 4  ssd   ──→  nvme       0   8.200  128MB  Data/sounds/music.pak                                          │
+│ 5  r1    ──→  ssd        0   7.100   64MB  Data/shaders/compiled.glsl                                     │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ Tier: reads  nvme    0 (0%)  ssd 2,400 (50%)  r1 2,412 (50%)                                              │
-│       iowait  nvme 0.0s(0%)  ssd  7.2s(28%)  r1 18.1s(72%)  gap  +27%  -1%  -26%                       │
-├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ # READS   IOWAIT    SIZE  WRITES  BRANCH  FILE                                                           │
-│ 1 4,521  22.600  12.5MB       0   r1     Data/textures/grass.dds                                         │
-│ 2 3,892  19.500   438MB       0   r1     Data/meshes/rock.nif                                            │
-│ 3 2,891  14.500  2.1GB        3   r1     Data/main.ba2                                                   │
-│ 4 2,100   8.200  128MB        0   ssd    Data/sounds/music.pak                                            │
-│ 5 1,800   7.100   64MB        0   r1     Data/shaders/compiled.glsl                                       │
-├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ Enter file number to move, range (e.g. 1-5), or 'all'. Press 'q' to quit.                                │
+│       iowait  nvme 0.0s(0%)  ssd  7.2s(28%)  r1 18.1s(72%)                                              │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-### 7.4 User actions
+FROM shows `...` if file exists on multiple branches (prefixed). Files with writes > 0
+are shown in dim text (shift+# skips them).
 
-- **Number**: select a file by row number
-- **Range**: e.g. `1-5` selects files 1 through 5
-- **`all`**: select all candidates
-- **`m`**: move selected files (triggers NAND source warning if applicable)
-- **`q`**: quit without moving
-- **`[`**: decrease sample interval by 5ms (faster, min 5ms)
-- **`]`**: increase sample interval by 5ms (slower)
+### 7.4 User actions (SELECT mode)
 
-### 7.5 NAND source warning
+- **0-9**: Mark file's target branch (color-coded)
+- **Shift+0-9**: Mark all files above (higher iowait) — files with writes skipped
+- **`-`**: Clear mark on selected file
+- **`Enter`**: Confirm moves → `execute_move_plan()`
+- **`q`**: Quit (confirmation if files are marked)
+- **`Space`**: Back to MONITOR mode (restarts fatrace)
+- **PageUp/PageDown**: Scroll by visible rows
+- **Home/End**: Jump to top/bottom
+- **`[`**: Decrease sample interval by 5ms (faster, min 5ms)
+- **`]`**: Increase sample interval by 5ms (slower)
 
-Any move from a NAND source (SSD or NVMe) triggers a confirmation:
+### 7.5 Scrolling
 
-```
-⚠ Source is NAND: /mnt/@/ssd_games/Data/textures/grass.dds
-  Moving SSD→NVMe may reduce NAND lifespan.
-  Confirm move? [y/N]
-```
+Visible rows clamped to 8-25 based on terminal height. Scroll position tracked
+via `_file_scroll` offset. Arrow keys, PageUp/PageDown, Home/End navigate.
 
-Uses Rich `Confirm.ask()` which pauses the TUI, shows the warning, and waits
-for y/N input.
+### 7.6 NAND source warning
 
-### 7.6 Rich markup and highlighting
+If source branch is NAND (SSD or NVMe) and `nand_warn` is ON, pressing `M`
+shows a confirmation panel before allowing moves. Toggle with `M` key.
 
-- `Table.add_row(..., style="bold")` for highlighted rows
-- Rich markup like `[bold red]`, `[dim]`, `[reverse]` for inline styling
+### 7.7 Rich markup and highlighting
+
+- `Table.add_row(..., style="reverse")` for selected row
+- Rich markup like `[bold]`, `[dim]`, `[reverse]` for inline styling
 - `style` kwarg on individual cells for per-column coloring
-- `row_styles` for alternating row backgrounds
+- Color-coded FROM/TO columns by speed class
 
 ## 8. Migration (mover.py)
 
-### 8.1 Pipeline
+### 8.1 MovePlan execution
 
-For each selected file, in rank order:
+The TUI returns a list of `MovePlan` objects (file path + target branch + is_rename_only).
+`execute_move_plan()` processes each plan:
+
+```
+For each MovePlan:
+  1. Check if file already on target branch (StateManager lookup)
+     → If yes: smart rename (swap prefix, no copy)
+  2. Otherwise: copy + verify + rename + record
+```
+
+### 8.2 Smart rename
+
+If a file was previously moved to the target branch (per StateManager),
+the copy is skipped. The prefixed original is renamed back:
+
+```
+_dimergio_grass.dds → grass.dds  (on target branch)
+```
+
+This handles the case where:
+- User moved file HDD → SSD
+- Later, file is on SSD and user wants to move SSD → NVMe
+- File already exists on SSD (as `_dimergio_grass.dds`)
+- Just rename it back — no copy needed
+
+### 8.3 Copy and rename pipeline
+
+For files NOT already on the target branch:
 
 ```
 1. COPY  → shutil.copy2(src_path, dst_path) on branch
 2. VERIFY → os.stat(src) vs os.stat(dst): size must match
 3. VERIFY (optional) → SHA256 source, SHA256 destination, compare (--verify flag)
 4. RENAME → os.rename(src, src.with_name(f"{prefix}{src.name}"))
-5. RECORD → state.add(file, src_branch, dst_branch, moved_at)
+5. RECORD → state.add(MoveEntry)
 ```
 
-### 8.2 Path resolution
+### 8.4 Path resolution
 
 Given a file path through mergerfs (`/mnt/pool/Data/file.ba2`):
 
@@ -483,7 +533,7 @@ Given a file path through mergerfs (`/mnt/pool/Data/file.ba2`):
 
 Relative path = path relative to the pool root.
 
-### 8.3 Directory creation
+### 8.5 Directory creation
 
 On the target branch: `os.makedirs(target_dir, exist_ok=True)`
 Copy permission bits + ownership from the source directory (`shutil.copymode`,
@@ -615,55 +665,70 @@ loaded and new data is merged.
 ## 10. CLI Reference (cli.py)
 
 ```
-usage: dimergio [options]
+usage: dimergio <command> [options]
 
-options:
-  --pool PATH     Mergerfs pool mount point  [default: /mnt/games]
-  --data PATH     Restrict to reads under this path (default: CWD inside pool, else pool root)
-  --process NAME  Auto-quit when this process exits (matches /proc/<pid>/cmdline)
-  --pid N         Auto-quit when this PID exits
-  --sudo          Run fatrace via sudo (needs CAP_SYS_ADMIN for fanotify)
-  --no-interactive  Disable interactive PID monitor (headless mode)
-  --verbose, -v   Log raw fatrace lines + parsing decisions to stderr
-  --auto-quit     Enable auto-quit in interactive mode (default: OFF)
-  --version       Show version and exit
+Commands:
+  watch      Run fatrace, collect, analyze, and select files to move
+  analyze    Analyze existing fatrace log
+  status     Show migration state
+  cleanup    Verify old migrations and clean up originals
+  undo       Undo migrations
 ```
 
-### 10.1 Flag details
+### 10.1 `dimergio watch`
 
-**`--pool PATH`**: Root of the mergerfs pool. The tool discovers all branches
-from the mergerfs mount options. Default: `/mnt/games`.
+```
+dimergio watch [options]
 
-**`--data PATH`**: Restrict observation to reads under this path. If not given,
-defaults to CWD if inside the pool, else the pool root.
+Options:
+  --pool PATH           Mergerfs pool mount point [default: /mnt/games]
+  --data PATH           Restrict to reads under this path (default: CWD inside pool, else pool root)
+  --process NAME        Auto-quit when this process exits (matches /proc/<pid>/cmdline)
+  --pid N               Auto-quit when this PID exits
+  --sudo                Run fatrace via sudo (needs CAP_SYS_ADMIN for fanotify)
+  --iowait-interval N   I/O wait sampling interval in ms [default: 10]
+  --verify              SHA256-verify each file after copy
+  --no-interactive      Disable interactive PID monitor (headless mode)
+  --verbose, -v         Log raw fatrace lines + parsing decisions to stderr
+  --version             Show version and exit
+```
 
-**`--process NAME`**: Monitor a specific process. In passive mode (no TUI),
-auto-quit when no events from NAME arrive in 30 seconds. In interactive mode,
-auto-quit is ON by default.
+### 10.2 `dimergio analyze`
 
-**`--pid N`**: Monitor a specific PID. Auto-quit when the PID disappears.
+```
+dimergio analyze --log PATH [options]
 
-**`--sudo`**: Run fatrace via sudo (needed for CAP_SYS_ADMIN). Skips UID
-filtering. Requires `sudo-rs` or standard sudo with cached credentials.
+Options:
+  --log PATH            Path to fatrace log file (required)
+  --pool PATH           Mergerfs pool mount point [default: /mnt/games]
+  --data PATH           Restrict to reads under this path
+  --verify              SHA256-verify each file after copy
+```
 
-**`--no-interactive`**: Headless mode. No TUI. Outputs periodic status to
-stderr. Used for scripting or piping.
+### 10.3 `dimergio status`
 
-**`--verbose` / `-v`**: Logs every raw fatrace line and parsing decision
-to stderr. Useful for debugging path resolution and event filtering.
+```
+dimergio status [--pool PATH]
+```
 
-**`--auto-quit`**: Explicitly enable auto-quit in interactive mode. Useful
-for scripts or when you want the TUI to stop automatically after the target
-process exits.
+Shows all migrations with status (verified/pending/problem), moved date, and file size.
 
-**`--version`**: Print `dimergio 0.1.1` and exit.
+### 10.4 `dimergio cleanup`
 
-### 10.2 Path resolution
+```
+dimergio cleanup [--pool PATH]
+```
 
-The tool automatically discovers pool branches from the mergerfs mount. Fatrace
-runs against the raw btrfs volume mounts (not the FUSE mount), and paths are
-remapped to pool-relative via the volume map. This handles symlinks, bind mounts,
-and mergerfs mount aliases transparently.
+Walks through unverified migrations older than 14 days and asks you to
+confirm each one.
+
+### 10.5 `dimergio undo`
+
+```
+dimergio undo [--pool PATH] [--all]
+```
+
+Undo migrations. Without `--all`, shows a numbered list and lets you pick.
 
 ## 11. Configuration (config.py)
 
@@ -693,6 +758,7 @@ Created on first run with defaults if absent.
 - `Rich` for TUI: `Live`, `Table`, `Panel`, `Console`, `Prompt`, `Confirm`
 - `threading.Thread(daemon=True)` for keyboard reader and iowait sampler
 - `termios`/`tty` for raw keyboard input (isolated from Rich I/O)
+- `pyyaml` for stats persistence (`.dimergio.yaml` on largest branch)
 
 ## 13. Non-goals
 

@@ -47,45 +47,40 @@ uv pip install -e .
 **1. Observe** — run your program through dimergio:
 
 ```bash
-dimergio --pool /mnt/pool --data /mnt/pool/Data --pid 12345 --sudo
+dimergio watch --pool /mnt/pool --data /mnt/pool/Data --pid 12345 --sudo
 ```
 
 dimergio spawns `fatrace -f RW -u -t -p <pid>`, samples `io_ticks` from
-`/sys/block/*/stat` at 50ms intervals, and merges each read/write event
+`/sys/block/*/stat` at 100Hz, and merges each read/write event
 with the device busy% at that moment.
 
 The Rich TUI shows live process stats, file table, and tier summary.
-Hit `q` when done (or use `--pid` for auto-stop when the process exits).
+Hit `Space` or `Enter` when done to switch to SELECT mode (or `q` to quit).
 
-**2. Review** — after observation stops, the Candidate screen shows:
+**2. Select** — in SELECT mode, mark files for migration:
 
 ```
-╭─ dimergio — candidate files ─────────────────────────────────────────────────────╮
-│ Tier: reads  nvme    0 (0%)  ssd 2,400 (50%)  r1 2,412 (50%)                     │
-│       iowait  nvme 0.0s(0%)  ssd  7.2s(28%)  r1 18.1s(72%)                     │
-├──────────────────────────────────────────────────────────────────────────────────┤
-│ # READS   IOWAIT    SIZE  WRITES  BRANCH  FILE                                  │
-│ 1 4,521  22.600  12.5MB       0   r1     Data/textures/grass.dds                │
-│ 2 3,892  19.500   438MB       0   r1     Data/meshes/rock.nif                   │
-│ …                                                                                │
-│ Enter file number to move, range (e.g. 1-5), or 'all'.                           │
-╰──────────────────────────────────────────────────────────────────────────────────╯
+# FROM        TO     WRITES  IOWAIT    SIZE  FILE
+1  r1    ──→  ssd        0  22.600  12.5MB  Data/textures/grass.dds
+2  r1    ──→  ssd        0  19.500   438MB  Data/meshes/rock.nif
 ```
 
-Select files by number, range, or `all`. Press `m` to move.
+- Press `0-9` to mark a file's target branch (color-coded by speed class)
+- Press `Shift+0-9` to mark all files above (higher iowait)
+- Press `Enter` to confirm moves
+- Press `q` to quit (with confirmation if files are marked)
 
 **3. Migrate** — files are copied to the target branch, verified (size), and
 the originals are renamed with a `_dimergio_` prefix. mergerfs now sees
-only the fast-branch copy.
+only the fast-branch copy. Smart rename: if file already on target branch,
+just swaps prefix (no copy needed).
 
 ```
-Moving 38 files...
-  1/38 ✓ Data/textures/grass.dds                 12.5MB   → ssd
-  2/38 ✓ Data/meshes/rock.nif                   438.0MB   → ssd
-  3/38 ✗ Data/main.ba2                            2.1GB   disk full
-  …
+Executing 2 moves...
+  1/2 ✓ Data/textures/grass.dds                    r1 → ssd
+  2/2 ✓ Data/meshes/rock.nif                       r1 → ssd
 
-Done: 37 moved, 1 failed. 5.2GB copied to ssd.
+Done: 2 moved, 0 failed.
 Original files renamed with prefix '_dimergio_'.
 ```
 
@@ -102,24 +97,35 @@ confirm each one. If something breaks:
 dimergio undo --pool /mnt/pool
 ```
 
+Stats are saved to `.dimergio.yaml` on the largest branch root when the TUI exits.
+They persist across sessions and track read/write counts and iowait per file.
+
 ## Commands
 
 ```
-dimergio [options]
+dimergio <command> [options]
+
+Commands:
+  watch      Run fatrace, collect, analyze, and select files to move
+  analyze    Analyze existing fatrace log
+  status     Show migration state
+  cleanup    Verify old migrations and clean up originals
+  undo       Undo migrations
 ```
 
-### Options
+### watch options
 
 | Flag | Default | Description |
 |---|---|---|
 | `--pool PATH` | `/mnt/games` | Mergerfs pool mount point |
 | `--data PATH` | pool root | Restrict tracking to files under this directory |
 | `--pid N` | — | Auto-stop when PID N exits |
-| `--process NAME` | — | Auto-stop when process NAME stops reading for 30s |
+| `--process NAME` | — | Auto-stop when process NAME stops reading |
 | `--sudo` | — | Run fatrace via sudo (needs CAP_SYS_ADMIN) |
+| `--iowait-interval N` | 10 | I/O wait sampling interval in ms |
+| `--verify` | — | SHA256-verify each file after copy |
 | `--no-interactive` | — | Headless mode (no TUI) |
 | `--verbose`, `-v` | — | Log raw fatrace lines to stderr |
-| `--auto-quit` | OFF | Enable auto-quit in interactive mode |
 | `--version` | — | Show version and exit |
 
 ## Performance
@@ -250,8 +256,20 @@ collector._parse_line()          ─── ReadEvent (timestamp, proc, pid, uid,
     │                                  FileAccumulator.write_count++   (W events)
     │                                  FileAccumulator.iowait_debt += iowait_sec
     │
-    └── collector._update_pid_stats() ── PidStat.read_count++, pid_iowait_sec[pid] += iowait_sec
-                                          PidStat.write_count++ on W events
+    ├── collector._update_pid_stats() ── PidStat.read_count++, pid_iowait_sec[pid] += iowait_sec
+    │                                    PidStat.write_count++ on W events
+    │
+    └── TUI (MONITOR mode) ────── Read-only observation
+                                    │
+                                    ├── Space ──── Stop → SELECT mode
+                                    └── Enter ──── Switch to SELECT mode
+
+SELECT mode ────────────────────── Branch marking + file selection
+    │
+    ├── 0-9 ────── Mark target branch (color-coded)
+    ├── Shift+0-9  Mark above (skip writes)
+    ├── Enter ──── Confirm → execute_move_plan()
+    └── q ──────── Quit (confirmation if marked)
 ```
 
 ## Key Concepts
@@ -264,6 +282,8 @@ collector._parse_line()          ─── ReadEvent (timestamp, proc, pid, uid,
 - **Gap** — target - actual per branch. Positive = spare capacity.
 - **Multi-tier moves** — files move from overloaded branches to branches with
   positive gap, proportional to their capacity.
+- **Smart rename** — if file already on target branch, just swap prefix (no copy).
+- **Stats persistence** — `.dimergio.yaml` on largest branch root, additive merge across sessions.
 
 ## Why not...
 
