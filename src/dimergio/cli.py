@@ -8,7 +8,7 @@ from pathlib import Path
 from .analyze import analyze
 from .collector import Collector
 from .config import load as load_config
-from .model import AnalysisResult, MovePlan
+from .model import AnalysisResult, FileAccumulator, MovePlan
 from .mover import execute_move_plan
 from .pool import find_pool
 from .state import StateManager
@@ -55,46 +55,39 @@ def cmd_watch(args: argparse.Namespace) -> None:
     cfg = load_config()
     iowait_ms = args.iowait_interval or cfg.get("iowait_interval_ms", 10)
 
-    collector = Collector(
-        pool=pool,
-        data_path=data_path,
-        process_name=args.process,
-        pid=args.pid,
-        use_sudo=args.sudo,
-        iowait_interval_ms=iowait_ms,
-        no_interactive=args.no_interactive,
-        verbose=args.verbose,
-    )
-    accumulators = collector.run()
+    if args.offline:
+        if not args.log:
+            print("Error: --log is required with --offline")
+            sys.exit(1)
+        log_path = Path(args.log)
+        if not log_path.exists():
+            print(f"Error: log file '{log_path}' not found")
+            sys.exit(1)
+        accumulators = _parse_log(log_path, pool, data_path)
+        if not accumulators:
+            print("No relevant read events found in log.")
+            return
+        result = analyze(accumulators, pool, data_path)
+        _handle_result(result, pool, verify=args.verify)
+    else:
+        collector = Collector(
+            pool=pool,
+            data_path=data_path,
+            process_name=args.process,
+            pid=args.pid,
+            use_sudo=args.sudo,
+            iowait_interval_ms=iowait_ms,
+            no_interactive=args.no_interactive,
+            verbose=args.verbose,
+        )
+        accumulators = collector.run()
 
-    if not accumulators:
-        print("No read events collected. Nothing to analyze.")
-        return
+        if not accumulators:
+            print("No read events collected. Nothing to analyze.")
+            return
 
-    result = analyze(accumulators, pool, data_path, force_move=collector.force_move)
-    _handle_result(result, pool, verify=args.verify, move_plans=collector.move_plans)
-
-
-def cmd_analyze(args: argparse.Namespace) -> None:
-    pool = find_pool(args.pool)
-    if pool is None:
-        print(f"Error: no mergerfs pool found at '{args.pool}'")
-        sys.exit(1)
-
-    data_path = _resolve_data_path(args.data, pool)
-    log_path = Path(args.log)
-
-    if not log_path.exists():
-        print(f"Error: log file '{log_path}' not found")
-        sys.exit(1)
-
-    accumulators = _parse_log(log_path, pool, data_path)
-    if not accumulators:
-        print("No relevant read events found in log.")
-        return
-
-    result = analyze(accumulators, pool, data_path)
-    _handle_result(result, pool, verify=args.verify)
+        result = analyze(accumulators, pool, data_path, force_move=collector.force_move)
+        _handle_result(result, pool, verify=args.verify, move_plans=collector.move_plans)
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -314,7 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Smart file redistribution for mergerfs pools based on read observation.",
     )
     parser.add_argument("--version", action="version", version=f"dimergio {__version__}")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     wp = sub.add_parser("watch", help="Run fatrace, collect, analyze, and move files")
     wp.add_argument("--pool", default="/mnt/games", help="Mergerfs pool mount point")
@@ -322,8 +315,8 @@ def build_parser() -> argparse.ArgumentParser:
     wp.add_argument("--process",
                     help="Auto-quit when this process exits (matches /proc/<pid>/cmdline)")
     wp.add_argument("--pid", type=int, help="Auto-quit when this PID exits")
-    wp.add_argument("--sudo", action="store_true",
-                    help="Run fatrace via sudo (needs CAP_SYS_ADMIN for fanotify)")
+    wp.add_argument("--no-sudo", dest="sudo", action="store_false",
+                    help="Run fatrace without sudo (requires CAP_SYS_ADMIN on fatrace binary)")
     wp.add_argument("--iowait-interval", type=int, default=10,
                     help="I/O wait sampling interval in ms (default: 10 = 100Hz)")
     wp.add_argument("--verify", action="store_true",
@@ -332,13 +325,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Disable interactive PID monitor (headless mode)")
     wp.add_argument("--verbose", "-v", action="store_true",
                     help="Log raw fatrace output and parsing decisions to stderr")
-
-    ap = sub.add_parser("analyze", help="Analyze existing fatrace log")
-    ap.add_argument("--log", required=True, help="Path to fatrace log file")
-    ap.add_argument("--pool", default="/mnt/games", help="Mergerfs pool mount point")
-    ap.add_argument("--data", help="Restrict to reads under this path")
-    ap.add_argument("--verify", action="store_true",
-                    help="SHA256-verify each file after copy")
+    wp.add_argument("--offline", action="store_true",
+                    help="Analyze an existing fatrace log instead of live collection")
+    wp.add_argument("--log", help="Path to fatrace log file (required with --offline)")
 
     sp = sub.add_parser("status", help="Show migration state")
     sp.add_argument("--pool", default="/mnt/games", help="Pool to query")
@@ -350,4 +339,17 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--pool", default="/mnt/games", help="Pool to undo")
     up.add_argument("--all", action="store_true", help="Undo all migrations")
 
+    parser.set_defaults(
+        sudo=True,
+        pool="/mnt/games",
+        data=None,
+        process=None,
+        pid=None,
+        iowait_interval=10,
+        verify=False,
+        no_interactive=False,
+        verbose=False,
+        offline=False,
+        log=None,
+    )
     return parser

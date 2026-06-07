@@ -4,7 +4,7 @@ import logging
 import sys
 
 from . import __version__
-from .cli import build_parser, cmd_analyze, cmd_cleanup, cmd_status, cmd_undo, cmd_watch
+from .cli import build_parser, cmd_cleanup, cmd_status, cmd_undo, cmd_watch
 
 
 def main() -> None:
@@ -20,10 +20,8 @@ def main() -> None:
     args = parser.parse_args()
 
     match args.command:
-        case "watch":
+        case "watch" | None:
             cmd_watch(args)
-        case "analyze":
-            cmd_analyze(args)
         case "status":
             cmd_status(args)
         case "cleanup":

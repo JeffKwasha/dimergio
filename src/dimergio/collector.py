@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import select
+import shutil
 import subprocess
 import sys
 import threading
@@ -242,8 +243,11 @@ class Collector:
         cmd = [_FATRACE, "-f", "RW", "-u", "-t", "-t"]
         if self.use_sudo:
             if os.geteuid() != 0:
-                # Authenticate before TUI so password prompt isn't swallowed
-                subprocess.run(["sudo", "-v"])
+                import getpass
+                user = getpass.getuser()
+                fatrace_path = shutil.which("fatrace") or _FATRACE
+                print(f"\nTip: run this once to skip the password prompt:")
+                print(f"  echo '{user} ALL=(root) NOPASSWD: {fatrace_path}' | sudo tee /etc/sudoers.d/dimergio && sudo chmod 0440 /etc/sudoers.d/dimergio\n")
             cmd = ["sudo"] + cmd
 
         proc = subprocess.Popen(
