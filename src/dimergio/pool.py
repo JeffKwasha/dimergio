@@ -86,6 +86,24 @@ def find_pool(mount_point: str | Path) -> Pool | None:
     return None
 
 
+def find_pool_for_cwd() -> Pool | None:
+    """Find mergerfs pool containing current working directory (mount or branch)."""
+    cwd = Path.cwd().resolve()
+    for pool in discover_pools():
+        try:
+            cwd.relative_to(pool.mount)
+            return pool
+        except ValueError:
+            pass
+        for branch in pool.branches:
+            try:
+                cwd.relative_to(branch.path.resolve())
+                return pool
+            except ValueError:
+                continue
+    return None
+
+
 def _resolve_device(branch_path: Path) -> str | None:
     """Map a branch path to its dm-X device name."""
     # Get mount source from /proc/mounts

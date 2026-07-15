@@ -20,21 +20,26 @@ def execute_move_plan(
     prefix: str = "_dimergio_",
     verify: bool = False,
     dry_run: bool = False,
-) -> tuple[int, int, list[str]]:
+) -> tuple[int, int, list[str], list[dict], int]:
     state = StateManager(pool.name)
     total = len(plans)
     succeeded = 0
     failed: list[str] = []
-    branch_map = {b.label: b for b in pool.branches}
+    operations: list[dict] = []
+    total_bytes = 0
 
     print(f"\nExecuting {total} moves...\n")
 
     for i, plan in enumerate(plans, 1):
-        rel = plan.file.relative_to(pool.mount)
-        src_branch = pool.primary_branch
-        dst_branch = branch_map.get(plan.target_branch)
-        if dst_branch is None:
-            print(f"  {i}/{total} \u2717 {plan.file.name:<50s}  unknown branch {plan.target_branch}")
+        rel = plan.file.path.relative_to(pool.mount)
+        if plan.file.branch_idx >= len(pool.branches) or plan.target_branch_idx >= len(pool.branches):
+            print(f"  {i}/{total} \u2717 {plan.file.path.name:<50s}  invalid branch index")
+            failed.append(str(rel))
+            continue
+        src_branch = pool.branches[plan.file.branch_idx]
+        dst_branch = pool.branches[plan.target_branch_idx]
+        if src_branch is None or dst_branch is None:
+            print(f"  {i}/{total} \u2717 {plan.file.path.name:<50s}  unknown branch")
             failed.append(str(rel))
             continue
 
@@ -42,24 +47,28 @@ def execute_move_plan(
         dst_path = dst_branch.path / rel
 
         if dry_run:
-            print(f"  {i}/{total} dry-run {plan.file.name:<50s}  {src_branch.label} \u2192 {dst_branch.label}")
+            print(f"  {i}/{total} dry-run {plan.file.path.name:<50s}  {src_branch.label} \u2192 {dst_branch.label}")
             succeeded += 1
             continue
 
         try:
             if plan.is_rename_only:
-                _smart_rename(src_path, dst_path, prefix, state, str(rel), src_branch.label, dst_branch.label)
+                entry = _smart_rename(src_path, dst_path, prefix, state, str(rel), src_branch.label, dst_branch.label)
             else:
-                _copy_and_rename(src_path, dst_path, prefix, state, str(rel), src_branch.label, dst_branch.label, verify)
+                entry = _copy_and_rename(src_path, dst_path, prefix, state, str(rel), src_branch.label, dst_branch.label, verify)
 
-            print(f"  {i}/{total} \u2713 {plan.file.name:<50s}  {src_branch.label} \u2192 {dst_branch.label}")
+            copied = 0 if plan.is_rename_only else entry.file_size
+            total_bytes += copied
+            operations.append({"pool_path": str(rel), "src": src_branch.label, "dst": dst_branch.label, "bytes": copied, "ok": True})
+            print(f"  {i}/{total} \u2713 {plan.file.path.name:<50s}  {src_branch.label} \u2192 {dst_branch.label}  {_fmt_bytes(copied)}")
             succeeded += 1
 
         except OSError as e:
             if dst_path.exists() and not plan.is_rename_only:
                 dst_path.unlink(missing_ok=True)
-            print(f"  {i}/{total} \u2717 {plan.file.name:<50s}  {e}")
+            print(f"  {i}/{total} \u2717 {plan.file.path.name:<50s}  {e}")
             failed.append(str(rel))
+            operations.append({"pool_path": str(rel), "src": src_branch.label, "dst": dst_branch.label, "bytes": 0, "ok": False})
 
     print()
     if succeeded:
@@ -72,7 +81,7 @@ def execute_move_plan(
     else:
         print("No files were moved.")
 
-    return succeeded, len(failed), failed
+    return succeeded, len(failed), failed, operations, total_bytes
 
 
 def _smart_rename(
@@ -83,7 +92,7 @@ def _smart_rename(
     pool_path: str,
     src_label: str,
     dst_label: str,
-) -> None:
+) -> MoveEntry:
     renamed_name = f"{prefix}{src_path.name}"
     renamed_path = src_path.parent / renamed_name
 
@@ -104,6 +113,7 @@ def _smart_rename(
         file_size=dst_path.stat().st_size,
     )
     state.add(entry)
+    return entry
 
 
 def _copy_and_rename(
@@ -115,7 +125,7 @@ def _copy_and_rename(
     src_label: str,
     dst_label: str,
     verify: bool,
-) -> None:
+) -> MoveEntry:
     if not dst_path.parent.exists():
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -153,6 +163,7 @@ def _copy_and_rename(
         file_size=dst_stat.st_size,
     )
     state.add(entry)
+    return entry
 
 
 def _hash_file(path: Path) -> str:

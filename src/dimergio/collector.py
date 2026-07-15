@@ -119,6 +119,7 @@ class Collector:
         iowait_interval_ms: int = 10,
         no_interactive: bool = False,
         verbose: bool = False,
+        preloaded: dict[Path, FileAccumulator] | None = None,
     ):
         self.pool = pool
         self.data_path = data_path or pool.mount
@@ -137,6 +138,7 @@ class Collector:
         self._verbose = verbose
         self.force_move = False
         self.move_plans: list = []
+        self._preloaded = preloaded
         self._build_volume_map()
 
     def _build_volume_map(self) -> None:
@@ -235,6 +237,21 @@ class Collector:
         return all(s.exited for s in tracked)
 
     def run(self) -> dict[Path, FileAccumulator]:
+        if self._preloaded is not None:
+            self._accumulators = dict(self._preloaded)
+            use_interactive = (
+                not self.pid
+                and not self.process_name
+                and not self._no_interactive
+                and sys.stdin.isatty()
+            )
+            if use_interactive:
+                self._run_interactive(None, None, None, start_in_select=True)
+            nfiles = len(self._accumulators)
+            nreads = sum(a.total_reads for a in self._accumulators.values())
+            logger.info("done (preloaded) — %d reads, %d files", nreads, nfiles)
+            return self._accumulators
+
         _FATRACE = "/usr/sbin/fatrace"
 
         sampler = IOWaitSampler(self.pool.branches, self.iowait_interval_ms)
@@ -321,7 +338,7 @@ class Collector:
                     break
             self._stop_flag.wait(1.0)
 
-    def _run_interactive(self, proc, read_thread, sampler) -> None:
+    def _run_interactive(self, proc, read_thread, sampler, *, start_in_select: bool = False) -> None:
         from rich.box import SIMPLE as _SIMPLE_BOX
         from rich.console import Console, Group
         from rich.live import Live
@@ -340,12 +357,14 @@ class Collector:
         auto_quit = False
         nand_warn = True
 
-        mode = "monitor"  # "monitor" or "select"
-        monitoring = True
+        mode = "select" if start_in_select else "monitor"
+        monitoring = not start_in_select
         file_scroll = 0
         file_selected = 0
         file_marks: dict[Path, int] = {}
+        pending_plans: list = []
         confirm_quit = False
+        clear_stats_at: float | None = None
         proc_box = [proc]
 
         branches = self.pool.branches
@@ -625,22 +644,63 @@ class Collector:
 
             if confirm_quit:
                 status = Text("Quit without moving? Press Y to confirm, any other key to cancel.", style="bold yellow")
+            elif clear_stats_at is not None:
+                status = Text("Press c again within 4s to clear session stats, any other key to cancel.", style="bold yellow")
             else:
-                status = Text("↑↓:scroll  0-9:mark branch  Shift+0-9:mark above  -:clear  Enter:move  q:quit", style="dim")
+                status = Text("↑↓:highlight  Space:rotate branch  m:monitor  0-9:mark  Shift+0-9:mark above  -:clear  c:clear stats  Enter:preview  q:quit", style="dim")
 
             return Panel(
                 Group(header, file_table, legend, space_line, status),
                 title=f"dimergio — {self.pool.mount}  [bold green]SELECT[/bold green]",
-                subtitle="↑↓:scroll  PgUp/PgDn/Home/End  0-9:mark  Enter:move  q:quit",
+                subtitle="↑↓:highlight  Space:rotate  m:monitor  0-9:mark  Enter:preview  q:quit",
                 border_style="dim",
+            )
+
+        # ─── PREVIEW layout ─────────────────────────────────────────────
+        def _build_preview() -> Panel:
+            total = 0
+            table = Table(show_header=True, header_style="bold", box=_SIMPLE_BOX, expand=True, pad_edge=False)
+            table.add_column("#", justify="right", width=4, no_wrap=True)
+            table.add_column("FROM", width=8, no_wrap=True)
+            table.add_column("TO", width=8, no_wrap=True)
+            table.add_column("FILE", no_wrap=True, ratio=1)
+            table.add_column("SIZE", justify="right", width=10, no_wrap=True)
+
+            for i, plan in enumerate(pending_plans, 1):
+                acc = plan.file
+                src = branches[acc.branch_idx] if acc.branch_idx < len(branches) else branches[0]
+                tgt = branches[plan.target_branch_idx]
+                try:
+                    sz = acc.path.stat().st_size
+                except OSError:
+                    sz = 0
+                total += sz
+                table.add_row(
+                    str(i),
+                    f"[{_branch_color(src.speed_class)}]{src.short_label}[/{_branch_color(src.speed_class)}]",
+                    f"[{_branch_color(tgt.speed_class)}]{tgt.short_label}[/{_branch_color(tgt.speed_class)}]",
+                    _rel_path(acc.path),
+                    _fmt_bytes(sz),
+                )
+
+            header = Text.from_markup(
+                f"[bold]{len(pending_plans)} move(s)[/bold]  total {_fmt_bytes(total)}"
+            )
+            status = Text("Enter: apply moves   Esc/q: back to select", style="bold yellow")
+
+            return Panel(
+                Group(header, table),
+                title=f"dimergio — {self.pool.mount}  [bold yellow]PREVIEW[/bold yellow]",
+                subtitle="Enter: apply  Esc: cancel",
+                border_style="yellow",
             )
 
         # ─── Key handling ───────────────────────────────────────────────
         _SHIFT_MAP = {")": 0, "!": 1, "@": 2, "#": 3, "$": 4, "%": 5, "^": 6, "&": 7, "*": 8, "(": 9}
 
         def _handle_key(key: str) -> bool:
-            nonlocal mode, monitoring, file_scroll, file_selected, confirm_quit
-            nonlocal auto_quit, nand_warn, quiesce_start, auto_detect_done
+            nonlocal mode, monitoring, file_scroll, file_selected, confirm_quit, clear_stats_at
+            nonlocal auto_quit, nand_warn, quiesce_start, auto_detect_done, pending_plans
 
             if confirm_quit:
                 if key in ("y", "Y", "\r", "\n"):
@@ -648,8 +708,13 @@ class Collector:
                 confirm_quit = False
                 return False
 
+            if clear_stats_at is not None and key != "c":
+                clear_stats_at = None
+
             if mode == "monitor":
                 return _handle_monitor_key(key)
+            elif mode == "preview":
+                return _handle_preview_key(key)
             else:
                 return _handle_select_key(key)
 
@@ -659,6 +724,8 @@ class Collector:
             if key == "q":
                 return True
             elif key == " ":
+                if proc_box[0] is None:
+                    return False
                 if monitoring:
                     monitoring = False
                     proc_box[0].terminate()
@@ -693,7 +760,7 @@ class Collector:
             elif key == "M":
                 nand_warn = not nand_warn
             elif key == "\r" or key == "\n":
-                if monitoring:
+                if proc_box[0] is not None and monitoring:
                     monitoring = False
                     proc.terminate()
                     proc.wait()
@@ -703,7 +770,8 @@ class Collector:
             return False
 
         def _handle_select_key(key: str) -> bool:
-            nonlocal mode, monitoring, file_scroll, file_selected, confirm_quit
+            nonlocal mode, monitoring, file_scroll, file_selected, confirm_quit, clear_stats_at
+            nonlocal pending_plans
             sorted_f = _sorted_files()
             max_vis = _visible_rows()
 
@@ -713,6 +781,14 @@ class Collector:
                 else:
                     return True
             elif key == " ":
+                if file_selected < len(sorted_f):
+                    acc = sorted_f[file_selected]
+                    tidx = file_marks.get(acc.path)
+                    nxt = (acc.branch_idx + 1) % len(branches) if tidx is None else (tidx + 1) % len(branches)
+                    file_marks[acc.path] = nxt
+            elif key == "m" or key == "M":
+                if proc_box[0] is None:
+                    return False
                 mode = "monitor"
                 monitoring = True
                 sampler.start()
@@ -760,19 +836,39 @@ class Collector:
                 if file_selected < len(sorted_f):
                     acc = sorted_f[file_selected]
                     file_marks.pop(acc.path, None)
+            elif key == "c":
+                now = time.time()
+                if clear_stats_at is not None and now - clear_stats_at <= 4:
+                    self._accumulators.clear()
+                    clear_stats_at = None
+                else:
+                    clear_stats_at = now
             elif key == "\r" or key == "\n":
-                self.move_plans = []
+                if not file_marks:
+                    return False
+                pending_plans = []
                 for acc in sorted_f:
                     tidx = file_marks.get(acc.path)
                     if tidx is None or tidx >= len(branches):
                         continue
                     from .model import MovePlan
-                    self.move_plans.append(MovePlan(
+                    pending_plans.append(MovePlan(
                         file=acc,
                         target_branch_idx=tidx,
                         is_rename_only=False,
                     ))
+                mode = "preview"
+                return False
+            return False
+
+        def _handle_preview_key(key: str) -> bool:
+            nonlocal mode, pending_plans
+            if key in ("\r", "\n"):
+                self.move_plans = pending_plans
                 return True
+            elif key in ("\x1b", "q", "Q", "c", "C", " "):
+                mode = "select"
+                return False
             return False
 
         # ─── Keyboard reader thread ─────────────────────────────────────
@@ -816,6 +912,8 @@ class Collector:
             now = time.time()
             if mode == "monitor":
                 return _build_monitor(now)
+            elif mode == "preview":
+                return _build_preview()
             return _build_select(now)
 
         try:
@@ -852,10 +950,7 @@ class Collector:
             t.join(timeout=2)
             termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
 
-        from .stats import load_stats, merge_stats, save_stats
-        existing = load_stats(self.pool)
-        merged = merge_stats(existing, self._accumulators, self.data_path)
-        save_stats(self.pool, merged)
+
 
     def _remap_volume_path(self, path: Path) -> Path | None:
         """Convert a raw btrfs volume path to a pool-relative path.

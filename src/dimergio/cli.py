@@ -5,12 +5,10 @@ import logging
 import sys
 from pathlib import Path
 
-from .analyze import analyze
 from .collector import Collector
 from .config import load as load_config
-from .model import AnalysisResult, FileAccumulator, MovePlan
 from .mover import execute_move_plan
-from .pool import find_pool
+from .pool import find_pool, find_pool_for_cwd
 from .state import StateManager
 
 logger = logging.getLogger(__name__)
@@ -36,6 +34,14 @@ def _resolve_data_path(args_data: str | None, pool) -> Path:
     return pool.mount
 
 
+def _get_default_pool() -> str | None:
+    """Get the pool path auto-detected from CWD, or None if not found."""
+    pool = find_pool_for_cwd()
+    if pool:
+        return str(pool.mount)
+    return None
+
+
 def cmd_watch(args: argparse.Namespace) -> None:
     pool = find_pool(args.pool)
     if pool is None:
@@ -56,19 +62,35 @@ def cmd_watch(args: argparse.Namespace) -> None:
     iowait_ms = args.iowait_interval or cfg.get("iowait_interval_ms", 10)
 
     if args.offline:
-        if not args.log:
-            print("Error: --log is required with --offline")
-            sys.exit(1)
-        log_path = Path(args.log)
-        if not log_path.exists():
-            print(f"Error: log file '{log_path}' not found")
-            sys.exit(1)
-        accumulators = _parse_log(log_path, pool, data_path)
-        if not accumulators:
-            print("No relevant read events found in log.")
-            return
-        result = analyze(accumulators, pool, data_path)
-        _handle_result(result, pool, verify=args.verify)
+        if args.from_log:
+            log_path = Path(args.from_log)
+            if not log_path.exists():
+                print(f"Error: log file '{log_path}' not found")
+                sys.exit(1)
+            accumulators = _parse_log(log_path, pool, data_path)
+            if not accumulators:
+                print("No relevant read events found in log.")
+                return
+        else:
+            from .stats import load_accumulators
+            accumulators = load_accumulators(pool, data_path)
+            if not accumulators:
+                print("No saved stats found. Run a watch session first.")
+                return
+
+        collector = Collector(
+            pool=pool,
+            data_path=data_path,
+            no_interactive=args.no_interactive,
+            preloaded=accumulators,
+        )
+        collector.run()
+
+        if collector.move_plans:
+            cfg = load_config()
+            summary = execute_move_plan(collector.move_plans, pool, prefix=cfg.get("prefix", "_dimergio_"), verify=args.verify)
+            _print_results(summary, pool)
+            _offer_free_originals(pool, cfg.get("prefix", "_dimergio_"), summary[0])
     else:
         collector = Collector(
             pool=pool,
@@ -82,12 +104,17 @@ def cmd_watch(args: argparse.Namespace) -> None:
         )
         accumulators = collector.run()
 
-        if not accumulators:
-            print("No read events collected. Nothing to analyze.")
-            return
+        if collector.move_plans:
+            cfg = load_config()
+            summary = execute_move_plan(collector.move_plans, pool, prefix=cfg.get("prefix", "_dimergio_"), verify=args.verify)
+            _print_results(summary, pool)
+            _offer_free_originals(pool, cfg.get("prefix", "_dimergio_"), summary[0])
 
-        result = analyze(accumulators, pool, data_path, force_move=collector.force_move)
-        _handle_result(result, pool, verify=args.verify, move_plans=collector.move_plans)
+        if accumulators:
+            from .stats import load_stats, merge_stats, save_stats
+            existing = load_stats(pool)
+            merged = merge_stats(existing, accumulators, data_path)
+            save_stats(pool, merged)
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -179,30 +206,6 @@ def cmd_undo(args: argparse.Namespace) -> None:
         _undo_one(args.pool, e, state)
 
 
-def _handle_result(result: AnalysisResult, pool, *, verify: bool = False, move_plans: list[MovePlan] | None = None) -> None:
-    if move_plans:
-        cfg = load_config()
-        execute_move_plan(move_plans, pool, prefix=cfg.get("prefix", "_dimergio_"), verify=verify)
-        return
-
-    if not result.candidates:
-        print("No files on slow branches to move.")
-        ans = input("Force move files to a different tier? (downgrade) [y/N]: ").strip().lower()
-        if ans not in ("y", "yes"):
-            return
-        print("Force-move enabled — files may be moved to slower tiers.")
-        return
-
-    if result.total_iowait == 0.0:
-        from .analyze import rank_by_reads
-        result = rank_by_reads(result)
-        print("Note: no I/O wait data available (offline log). Ranking by read count.")
-
-    print(f"\n{len(result.candidates)} candidates identified. Run the TUI to select files:")
-    print("  dimergio watch --pool <mount>")
-    print()
-
-
 def _parse_log(log_path: Path, pool, data_path: Path) -> dict:
     from .collector import _LINE_RE
     from .model import FileAccumulator
@@ -249,7 +252,6 @@ def _parse_log(log_path: Path, pool, data_path: Path) -> dict:
 
 
 def _find_branch_path(pool_mount: str, branch_label: str) -> Path | None:
-    from .pool import find_pool
     pool = find_pool(pool_mount)
     if pool:
         for b in pool.branches:
@@ -299,8 +301,100 @@ def _fmt_bytes(b: int) -> str:
     return f"{b}B"
 
 
+def _branch_speed_class(pool, label: str) -> str:
+    for b in pool.branches:
+        if b.label == label:
+            return b.speed_class
+    return "hdd"
+
+
+def _branch_path(pool, label: str) -> Path | None:
+    for b in pool.branches:
+        if b.label == label:
+            return b.path
+    return None
+
+
+def _print_results(summary, pool) -> int:
+    """Render the post-move operations list, color-coded by destination branch."""
+    succeeded, failed, _failed_list, operations, total_bytes = summary
+    if not operations:
+        return succeeded
+    from rich.console import Console
+    from rich.table import Table
+
+    color = {"hdd": "blue", "ssd": "teal", "nvme": "green"}
+    console = Console()
+    table = Table(title="Move operations", show_header=True, header_style="bold", expand=False)
+    table.add_column("#", justify="right", width=4)
+    table.add_column("FROM", width=10, no_wrap=True)
+    table.add_column("TO", width=10, no_wrap=True)
+    table.add_column("FILE", ratio=1, no_wrap=True)
+    table.add_column("COPIED", justify="right", width=10, no_wrap=True)
+
+    for i, op in enumerate(operations, 1):
+        sc = color.get(_branch_speed_class(pool, op["src"]), "red")
+        dc = color.get(_branch_speed_class(pool, op["dst"]), "red")
+        if op["ok"]:
+            table.add_row(
+                str(i),
+                f"[{sc}]{op['src']}[/{sc}]",
+                f"[{dc}]{op['dst']}[/{dc}]",
+                op["pool_path"],
+                _fmt_bytes(op["bytes"]),
+            )
+        else:
+            table.add_row(str(i), op["src"], op["dst"], f"[red]{op['pool_path']}[/red]", "[red]FAILED[/red]")
+
+    console.print(table)
+    unit = "GB" if total_bytes > 10 * (1 << 30) else "MB"
+    console.print(f"[bold]Total copied:[/bold] {_fmt_bytes(total_bytes)} ({unit})  —  {succeeded} moved, {failed} failed")
+    return succeeded
+
+
+def _offer_free_originals(pool, prefix: str, succeeded: int) -> None:
+    """After moves, offer to delete the now-redundant renamed originals."""
+    if succeeded <= 0:
+        return
+    state = StateManager(pool.name)
+    entries = state.all()
+    if not entries:
+        return
+
+    to_free = []
+    total = 0
+    for e in entries:
+        branch_path = _branch_path(pool, e.source_branch)
+        if not branch_path:
+            continue
+        renamed = branch_path / Path(e.pool_path).parent / e.renamed_basename
+        if renamed.exists():
+            to_free.append((e, renamed))
+            try:
+                total += renamed.stat().st_size
+            except OSError:
+                pass
+
+    if not to_free:
+        return
+
+    ans = input(f"\nFree {len(to_free)} redundant original file(s) ({_fmt_bytes(total)})? [y/N]: ").strip().lower()
+    if ans in ("y", "yes"):
+        for e, renamed in to_free:
+            try:
+                renamed.unlink()
+                state.remove(e.pool_path)
+                print(f"  Freed: {e.source_branch}/{e.pool_path}")
+            except OSError as ex:
+                print(f"  Error freeing {renamed}: {ex}")
+    else:
+        print("  Kept originals. Run 'dimergio cleanup' to verify & free later, or 'dimergio undo' to revert.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     from . import __version__
+
+    default_pool = _get_default_pool()
 
     parser = argparse.ArgumentParser(
         prog="dimergio",
@@ -309,8 +403,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"dimergio {__version__}")
     sub = parser.add_subparsers(dest="command")
 
+    pool_help = "Mergerfs pool mount point"
+    if default_pool:
+        pool_help += f" (default: auto-detected '{default_pool}')"
+
     wp = sub.add_parser("watch", help="Run fatrace, collect, analyze, and move files")
-    wp.add_argument("--pool", default="/mnt/games", help="Mergerfs pool mount point")
+    wp.add_argument("--pool", default=default_pool, help=pool_help)
     wp.add_argument("--data", help="Restrict to reads under this path (default: CWD inside pool, else pool root)")
     wp.add_argument("--process",
                     help="Auto-quit when this process exits (matches /proc/<pid>/cmdline)")
@@ -326,22 +424,23 @@ def build_parser() -> argparse.ArgumentParser:
     wp.add_argument("--verbose", "-v", action="store_true",
                     help="Log raw fatrace output and parsing decisions to stderr")
     wp.add_argument("--offline", action="store_true",
-                    help="Analyze an existing fatrace log instead of live collection")
-    wp.add_argument("--log", help="Path to fatrace log file (required with --offline)")
+                    help="Use saved stats instead of live fatrace collection")
+    wp.add_argument("--from-log", dest="from_log",
+                    help="Path to fatrace log file (with --offline)")
 
     sp = sub.add_parser("status", help="Show migration state")
-    sp.add_argument("--pool", default="/mnt/games", help="Pool to query")
+    sp.add_argument("--pool", default=default_pool, help=pool_help)
 
     cp = sub.add_parser("cleanup", help="Verify old migrations and clean up originals")
-    cp.add_argument("--pool", default="/mnt/games", help="Pool to clean up")
+    cp.add_argument("--pool", default=default_pool, help=pool_help)
 
     up = sub.add_parser("undo", help="Undo migrations")
-    up.add_argument("--pool", default="/mnt/games", help="Pool to undo")
+    up.add_argument("--pool", default=default_pool, help=pool_help)
     up.add_argument("--all", action="store_true", help="Undo all migrations")
 
     parser.set_defaults(
         sudo=True,
-        pool="/mnt/games",
+        pool=default_pool,
         data=None,
         process=None,
         pid=None,
@@ -350,6 +449,6 @@ def build_parser() -> argparse.ArgumentParser:
         no_interactive=False,
         verbose=False,
         offline=False,
-        log=None,
+        from_log=None,
     )
     return parser

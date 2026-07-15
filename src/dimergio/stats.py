@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import yaml
@@ -12,31 +13,37 @@ logger = logging.getLogger(__name__)
 _STATS_FILENAME = ".dimergio.yaml"
 
 
-def _largest_branch(pool: Pool) -> Path | None:
-    if not pool.branches:
-        return None
-    return max(pool.branches, key=lambda b: b.total_bytes).path
-
-
-def _stats_path(pool: Pool) -> Path | None:
-    root = _largest_branch(pool)
-    if root is None:
-        return None
-    return root / _STATS_FILENAME
+def _stats_path(pool: Pool) -> Path:
+    state_root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return state_root / "dimergio" / f"{pool.name}.yaml"
 
 
 def load_stats(pool: Pool) -> dict[str, dict]:
     path = _stats_path(pool)
-    if path is None:
-        return {}
     try:
         data = yaml.safe_load(path.read_text())
         if data is None:
             return {}
         return data.get("files", {})
     except (OSError, yaml.YAMLError) as e:
-        logger.warning("failed to load stats from %s: %s", path, e)
+        logger.info("no stats file at %s: %s", path, e)
         return {}
+
+
+def load_accumulators(pool: Pool, data_path: Path) -> dict[Path, FileAccumulator]:
+    raw = load_stats(pool)
+    result: dict[Path, FileAccumulator] = {}
+    for rel_str, entry in raw.items():
+        full_path = data_path / rel_str
+        acc = FileAccumulator(
+            path=full_path,
+            branch_idx=0,
+            total_reads=entry.get("reads", 0),
+            write_count=entry.get("writes", 0),
+            iowait_debt=entry.get("iowait_debt", 0.0),
+        )
+        result[full_path] = acc
+    return result
 
 
 def merge_stats(
@@ -66,10 +73,8 @@ def merge_stats(
 
 def save_stats(pool: Pool, stats: dict[str, dict]) -> bool:
     path = _stats_path(pool)
-    if path is None:
-        logger.warning("no branch found to save stats")
-        return False
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         data = {"files": stats}
         path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=True))
         logger.info("saved stats to %s (%d files)", path, len(stats))

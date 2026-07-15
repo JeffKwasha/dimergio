@@ -70,13 +70,15 @@ collector._parse_line()          ─── ReadEvent(timestamp, proc, pid, uid, 
 
 SELECT mode ────────────────────── File selection with branch targeting
     │
+    ├── ↑/↓ ────── Highlight file (cursor)
+    ├── Space ──── Rotate highlighted file's target branch forward
+    ├── m ──────── Back to MONITOR mode (restarts fatrace)
     ├── 0-9 ────── Mark file's target branch
     ├── Shift+0-9  Mark all files above (higher iowait) → skip files with writes
     ├── - ──────── Clear mark
-    ├── Enter ──── Confirm moves → execute_move_plan()
+    ├── Enter ──── Preview moves (PREVIEW panel) → confirm → execute_move_plan()
     ├── q ──────── Quit (confirmation if files marked)
-    ├── PageUp/Down/Home/End ── Scroll
-    └── Space ──── Back to MONITOR mode (restarts fatrace)
+    └── PageUp/Down/Home/End ── Scroll
 ```
 
 ## 4. Pool Discovery (pool.py)
@@ -433,7 +435,7 @@ Color-coded by speed class: blue=HDD, teal=SSD, green=NVMe.
 │ 0:05:32  reads 4,812  writes 17  files 87  iowait 25.3(18.1)s  active 2                                │
 │ Est. iowait: 25.3s  Move time: ~2.1s  Space required: 0B                                               │
 │ Tiers:  nvme=10x(ssd)  ssd=4x(ssd)  r1=1x(hdd)  total(ro) 25.3s                                       │
-│ [Space] monitor  [Enter] confirm  [q] quit  [0-9] mark  [Shift+0-9] mark above                          │
+│ [↑↓] highlight  [Space] rotate  [m] monitor  [0-9] mark  [Enter] preview  [q] quit                       │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ # FROM        TO     WRITES  IOWAIT    SIZE  FILE                                                        │
 │ 1  ssd   ──→  nvme       0  22.600  12.5MB  Data/textures/grass.dds                                      │
@@ -452,16 +454,34 @@ are shown in dim text (shift+# skips them).
 
 ### 7.4 User actions (SELECT mode)
 
+- **↑ / ↓**: Move the highlight cursor to a file
+- **Space**: Rotate the highlighted file's target branch forward (cycles through branches)
+- **`m`**: Return to MONITOR mode (restarts fatrace)
 - **0-9**: Mark file's target branch (color-coded)
 - **Shift+0-9**: Mark all files above (higher iowait) — files with writes skipped
 - **`-`**: Clear mark on selected file
-- **`Enter`**: Confirm moves → `execute_move_plan()`
+- **`Enter`**: Open PREVIEW panel (ordered, branch-color-coded list + total bytes)
 - **`q`**: Quit (confirmation if files are marked)
-- **`Space`**: Back to MONITOR mode (restarts fatrace)
 - **PageUp/PageDown**: Scroll by visible rows
 - **Home/End**: Jump to top/bottom
 - **`[`**: Decrease sample interval by 5ms (faster, min 5ms)
 - **`]`**: Increase sample interval by 5ms (slower)
+
+### 7.4.1 PREVIEW panel
+
+Pressing `Enter` in SELECT (with ≥1 marked file) opens a PREVIEW panel. Moves are
+listed in iowait-debt order, with FROM/TO columns color-coded by speed class and a
+per-file size plus a total. `Enter` confirms and calls `execute_move_plan()`;
+`Esc`/`q` returns to SELECT.
+
+### 7.4.2 Post-move summary and free prompt
+
+After `execute_move_plan()` returns, `cmd_watch` prints a color-coded operations
+table and the total bytes copied — shown in **MB**, or **GB** when over 10GB. It
+then prompts whether to free the redundant renamed originals (`_dimergio_` prefix).
+Answering `y` deletes them and removes the state entries (so they leave `undo`);
+`N` keeps them for later `cleanup` or `undo`. The prompt appears whenever at least
+one file was moved, even if zero bytes were copied (rename-only moves).
 
 ### 7.5 Scrolling
 
@@ -485,13 +505,17 @@ shows a confirmation panel before allowing moves. Toggle with `M` key.
 ### 8.1 MovePlan execution
 
 The TUI returns a list of `MovePlan` objects (file path + target branch + is_rename_only).
-`execute_move_plan()` processes each plan:
+`execute_move_plan()` processes each plan and returns
+`(succeeded, failed, failed_list, operations, total_bytes)`, where `operations` is a
+per-file record (`pool_path`, `src`, `dst`, `bytes`, `ok`) and `total_bytes` counts
+only copied (non-rename) bytes:
 
 ```
 For each MovePlan:
-  1. Check if file already on target branch (StateManager lookup)
-     → If yes: smart rename (swap prefix, no copy)
-  2. Otherwise: copy + verify + rename + record
+  1. Source branch = pool.branches[file.branch_idx]; target = pool.branches[target_branch_idx]
+  2. If file already on target branch (StateManager lookup)
+     → smart rename (swap prefix, no copy, 0 bytes)
+  3. Otherwise: copy + verify + rename + record (bytes = file size)
 ```
 
 ### 8.2 Smart rename
