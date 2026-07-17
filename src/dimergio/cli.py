@@ -8,7 +8,7 @@ from pathlib import Path
 from .collector import Collector
 from .config import load as load_config
 from .mover import execute_move_plan
-from .pool import find_pool, find_pool_for_cwd
+from .pool import PoolContext, find_pool, find_pool_for_cwd
 from .state import StateManager
 
 logger = logging.getLogger(__name__)
@@ -43,10 +43,8 @@ def _get_default_pool() -> str | None:
 
 
 def cmd_watch(args: argparse.Namespace) -> None:
-    pool = find_pool(args.pool)
-    if pool is None:
-        print(f"Error: no mergerfs pool found at '{args.pool}'")
-        sys.exit(1)
+    ctx = PoolContext(args.pool)
+    pool = ctx.pool
 
     data_path = _resolve_data_path(args.data, pool)
     if not data_path.exists():
@@ -89,8 +87,8 @@ def cmd_watch(args: argparse.Namespace) -> None:
         if collector.move_plans:
             cfg = load_config()
             summary = execute_move_plan(collector.move_plans, pool, prefix=cfg.get("prefix", "_dimergio_"), verify=args.verify)
-            _print_results(summary, pool)
-            _offer_free_originals(pool, cfg.get("prefix", "_dimergio_"), summary[0])
+            _, moved = _print_results(summary, pool)
+            _offer_free_originals(pool, cfg.get("prefix", "_dimergio_"), moved)
     else:
         collector = Collector(
             pool=pool,
@@ -107,8 +105,8 @@ def cmd_watch(args: argparse.Namespace) -> None:
         if collector.move_plans:
             cfg = load_config()
             summary = execute_move_plan(collector.move_plans, pool, prefix=cfg.get("prefix", "_dimergio_"), verify=args.verify)
-            _print_results(summary, pool)
-            _offer_free_originals(pool, cfg.get("prefix", "_dimergio_"), summary[0])
+            _, moved = _print_results(summary, pool)
+            _offer_free_originals(pool, cfg.get("prefix", "_dimergio_"), moved)
 
         if accumulators:
             from .stats import load_stats, merge_stats, save_stats
@@ -118,35 +116,54 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
 
 def cmd_status(args: argparse.Namespace) -> None:
-    pool_name = Path(args.pool).name.upper()
-    state = StateManager(pool_name)
+    ctx = PoolContext(args.pool)
+    state = ctx.state
     entries = state.all()
 
     if not entries:
-        print(f"No migrations recorded for pool '{args.pool}'.")
+        print(f"No migrations recorded for pool '{ctx.name}'.")
         return
 
-    print(f"\n=== dimergio status \u2014 pool: {pool_name} ===\n")
-    print(f"{'File':<50} {'Status':<12} {'Moved':<20} {'Size':>8}")
-    print("\u2500" * 92)
+    print(f"\n=== dimergio status \u2014 pool: {ctx.name} ===\n")
+    from rich.console import Console
+    from rich.table import Table
+
+    status_color = {"verified": "green", "pending": "yellow", "problem": "red"}
+    table = Table(show_header=True, header_style="bold", expand=False)
+    table.add_column("File", ratio=1, no_wrap=True)
+    table.add_column("Status", width=10, no_wrap=True)
+    table.add_column("Moved", width=21, no_wrap=True)
+    table.add_column("Size", justify="right", width=10, no_wrap=True)
+
     for e in entries:
-        status = "verified" if e.verified_working else "pending" if e.verified_working is None else "problem"
-        size_str = _fmt_bytes(e.file_size)
-        print(f"{e.pool_path:<50} {status:<12} {e.moved_at[:19]:<20} {size_str:>8}")
+        if e.verified_working is True:
+            status, sc = "verified", "green"
+        elif e.verified_working is False:
+            status, sc = "problem", "red"
+        else:
+            status, sc = "pending", "yellow"
+        table.add_row(
+            e.pool_path,
+            f"[{sc}]{status}[/{sc}]",
+            e.moved_at[:19],
+            _fmt_bytes(e.file_size),
+        )
+
+    Console().print(table)
 
 
 def cmd_cleanup(args: argparse.Namespace) -> None:
-    pool_name = Path(args.pool).name.upper()
-    state = StateManager(pool_name)
+    ctx = PoolContext(args.pool)
+    state = ctx.state
     cfg = load_config()
     days = cfg.get("cleanup_days", 14)
     entries = state.unverified(older_than_days=days)
 
     if not entries:
-        print(f"No unverified migrations older than {days} days for pool '{args.pool}'.")
+        print(f"No unverified migrations older than {days} days for pool '{ctx.name}'.")
         return
 
-    print(f"\n=== dimergio cleanup \u2014 pool: {pool_name} ===\n")
+    print(f"\n=== dimergio cleanup \u2014 pool: {ctx.name} ===\n")
     for e in entries:
         print(f"File: {e.pool_path}")
         print(f"  Orig: {e.source_branch} / {e.original_basename}  \u2192  {e.target_branch}")
@@ -154,7 +171,7 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
         ans = input("  Does your program still work? [Y/n/skip]: ").strip().lower()
 
         if ans in ("", "y", "yes"):
-            branch_path = _find_branch_path(args.pool, e.source_branch)
+            branch_path = ctx.branch_path(e.source_branch)
             if branch_path:
                 orig_file = branch_path / e.pool_path
                 renamed = orig_file.parent / e.renamed_basename
@@ -169,23 +186,23 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
                 print(f"  Could not locate source branch '{e.source_branch}'")
         elif ans == "n":
             state.mark_verified(e.pool_path, False)
-            _undo_one(args.pool, e, state)
+            _undo_one(ctx, e, state)
         else:
             print("  Skipped.")
         print()
 
 
 def cmd_undo(args: argparse.Namespace) -> None:
-    pool_name = Path(args.pool).name.upper()
-    state = StateManager(pool_name)
+    ctx = PoolContext(args.pool)
+    state = ctx.state
     entries = state.all()
 
     if not entries:
-        print(f"No migrations to undo for pool '{args.pool}'.")
+        print(f"No migrations to undo for pool '{ctx.name}'.")
         return
 
     if not args.all:
-        print(f"\n=== dimergio undo \u2014 pool: {pool_name} ===\n")
+        print(f"\n=== dimergio undo \u2014 pool: {ctx.name} ===\n")
         for i, e in enumerate(entries, 1):
             print(f"  {i}. {e.pool_path}  (\u2192 {e.target_branch})")
         print()
@@ -203,7 +220,7 @@ def cmd_undo(args: argparse.Namespace) -> None:
         to_undo = list(entries)
 
     for e in to_undo:
-        _undo_one(args.pool, e, state)
+        _undo_one(ctx, e, state)
 
 
 def _parse_log(log_path: Path, pool, data_path: Path) -> dict:
@@ -251,18 +268,9 @@ def _parse_log(log_path: Path, pool, data_path: Path) -> dict:
     return accumulators
 
 
-def _find_branch_path(pool_mount: str, branch_label: str) -> Path | None:
-    pool = find_pool(pool_mount)
-    if pool:
-        for b in pool.branches:
-            if b.label == branch_label:
-                return b.path
-    return None
-
-
-def _undo_one(pool_mount: str, entry, state: StateManager) -> None:
-    branch_path = _find_branch_path(pool_mount, entry.source_branch)
-    fast_path = _find_branch_path(pool_mount, entry.target_branch)
+def _undo_one(ctx: PoolContext, entry, state: StateManager) -> None:
+    branch_path = ctx.branch_path(entry.source_branch)
+    fast_path = ctx.branch_path(entry.target_branch)
     if not branch_path or not fast_path:
         print(f"  Error: cannot resolve branch paths for '{entry.pool_path}'")
         return
@@ -308,18 +316,13 @@ def _branch_speed_class(pool, label: str) -> str:
     return "hdd"
 
 
-def _branch_path(pool, label: str) -> Path | None:
-    for b in pool.branches:
-        if b.label == label:
-            return b.path
-    return None
-
-
-def _print_results(summary, pool) -> int:
-    """Render the post-move operations list, color-coded by destination branch."""
+def _print_results(summary, pool) -> tuple[int, list[str]]:
+    """Render the post-move operations list, color-coded by destination branch.
+    Returns (succeeded, moved_pool_paths) for the operations that succeeded."""
     succeeded, failed, _failed_list, operations, total_bytes = summary
+    moved_paths: list[str] = []
     if not operations:
-        return succeeded
+        return succeeded, moved_paths
     from rich.console import Console
     from rich.table import Table
 
@@ -343,28 +346,34 @@ def _print_results(summary, pool) -> int:
                 op["pool_path"],
                 _fmt_bytes(op["bytes"]),
             )
+            moved_paths.append(op["pool_path"])
         else:
             table.add_row(str(i), op["src"], op["dst"], f"[red]{op['pool_path']}[/red]", "[red]FAILED[/red]")
 
     console.print(table)
     unit = "GB" if total_bytes > 10 * (1 << 30) else "MB"
     console.print(f"[bold]Total copied:[/bold] {_fmt_bytes(total_bytes)} ({unit})  —  {succeeded} moved, {failed} failed")
-    return succeeded
+    return succeeded, moved_paths
 
 
-def _offer_free_originals(pool, prefix: str, succeeded: int) -> None:
-    """After moves, offer to delete the now-redundant renamed originals."""
-    if succeeded <= 0:
+def _offer_free_originals(pool, prefix: str, moved_paths: list[str]) -> None:
+    """After moves, offer to delete the now-redundant renamed originals
+    for the files moved in this session only."""
+    if not moved_paths:
         return
-    state = StateManager(pool.name)
-    entries = state.all()
+    ctx = PoolContext(pool)
+    state = ctx.state
+    entries = {e.pool_path: e for e in state.all()}
     if not entries:
         return
 
     to_free = []
     total = 0
-    for e in entries:
-        branch_path = _branch_path(pool, e.source_branch)
+    for pool_path in moved_paths:
+        e = entries.get(pool_path)
+        if e is None:
+            continue
+        branch_path = ctx.branch_path(e.source_branch)
         if not branch_path:
             continue
         renamed = branch_path / Path(e.pool_path).parent / e.renamed_basename

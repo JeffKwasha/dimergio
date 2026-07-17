@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .model import Candidate, MoveEntry, MovePlan, Pool
+from .pool import PoolContext
 from .state import StateManager
 
 
@@ -21,7 +22,7 @@ def execute_move_plan(
     verify: bool = False,
     dry_run: bool = False,
 ) -> tuple[int, int, list[str], list[dict], int]:
-    state = StateManager(pool.name)
+    state = PoolContext(pool).state
     total = len(plans)
     succeeded = 0
     failed: list[str] = []

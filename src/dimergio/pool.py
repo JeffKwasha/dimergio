@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 
 from .model import Branch, Pool
+from .state import StateManager
 
 
 def discover_pools() -> list[Pool]:
@@ -133,3 +135,48 @@ def _dm_name(device_path: str) -> str | None:
         except OSError:
             pass
     return None
+
+
+class PoolContext:
+    """A resolved mergerfs pool plus its derived resources (state, branch lookups).
+
+    This is the single source of pool identity: every command and helper goes
+    through it so the pool name used for state files can never diverge between
+    code paths. Accepts either an already-resolved ``Pool`` or a mount path/string
+    (which it resolves via :func:`find_pool`)."""
+
+    def __init__(self, pool_or_mount: "Pool | str | Path"):
+        if isinstance(pool_or_mount, Pool):
+            self.pool = pool_or_mount
+        else:
+            resolved = find_pool(pool_or_mount)
+            if resolved is None:
+                print(f"Error: no mergerfs pool found at '{pool_or_mount}'")
+                sys.exit(1)
+            self.pool = resolved
+
+        self._state: "StateManager | None" = None
+
+    @property
+    def name(self) -> str:
+        return self.pool.name
+
+    @property
+    def mount(self) -> Path:
+        return self.pool.mount
+
+    @property
+    def branches(self) -> list["Branch"]:
+        return self.pool.branches
+
+    @property
+    def state(self) -> "StateManager":
+        if self._state is None:
+            self._state = StateManager(self.pool.name)
+        return self._state
+
+    def branch_path(self, label: str) -> Path | None:
+        for b in self.pool.branches:
+            if b.label == label:
+                return b.path
+        return None

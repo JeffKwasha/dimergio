@@ -398,8 +398,8 @@ class Collector:
             return max(8, min(25, h - reserved))
 
         def _on_multiple_branches(acc) -> bool:
-            from .state import StateManager
-            state = StateManager(self.pool.name)
+            from .pool import PoolContext
+            state = PoolContext(self.pool).state
             rel = _rel_path(acc.path)
             for e in state.all():
                 if e.pool_path == rel:
