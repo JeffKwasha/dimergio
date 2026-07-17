@@ -33,7 +33,7 @@ benchmarking is performed. No assumptions are made about hardware latency.
          │
          ├── __init__.py      Package version (0.1.1)
          ├── __main__.py      Entry point (python -m dimergio), logging config
-         ├── pool.py          Mergerfs discovery from /proc, branch speed class auto-detection
+         ├── pool.py          Mergerfs discovery from /proc, branch speed class auto-detection, PoolContext for unified identity and state access
          ├── collector.py     fatrace subprocess, IOWait sampling, Rich TUI (MONITOR + SELECT modes),
          │                    process tracking, branch marking, file selection
          ├── model.py         Data classes (Pool, Branch, ReadEvent, FileAccumulator,

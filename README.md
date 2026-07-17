@@ -55,7 +55,7 @@ dimergio spawns `fatrace -f RW -u -t -p <pid>`, samples `io_ticks` from
 with the device busy% at that moment.
 
 The Rich TUI shows live process stats, file table, and tier summary.
-Hit `Space` or `Enter` when done to switch to SELECT mode (or `q` to quit).
+Hit `Enter` when done to switch to SELECT mode (or `q` to quit).
 
 **2. Select** — in SELECT mode, mark files for migration:
 
@@ -103,8 +103,8 @@ Original files renamed with prefix '_dimergio_'.
 dimergio cleanup --pool /mnt/pool
 ```
 
-Walks through unverified migrations older than 14 days and asks you to
-confirm each one. If something breaks:
+Walks through unverified migrations older than 7 days and asks you to
+confirm each one. Use `-a` to skip prompting or `-d` to change the day filter.
 
 ```bash
 dimergio undo --pool /mnt/pool
@@ -194,7 +194,7 @@ defaults:
 {
   "prefix": "_dimergio_",
   "state_dir": "~/.local/share/dimergio",
-  "cleanup_days": 14,
+  "cleanup_days": 7,
   "default_pool": "/mnt/games"
 }
 ```
