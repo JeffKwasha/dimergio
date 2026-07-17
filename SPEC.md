@@ -64,15 +64,15 @@ collector._parse_line()          ─── ReadEvent(timestamp, proc, pid, uid, 
     │                                    PidStat.write_count++ on W events
     │
     └── TUI (MONITOR mode) ────── Read-only observation: process table, file table, tier stats
-                                    │
-                                    ├── Space ──── Stop monitoring → SELECT mode
-                                    └── Enter ──── Switch to SELECT mode
+                                     │
+                                     ├── Enter ──── Switch to SELECT mode
+                                     └── Esc/q ──── Quit
 
 SELECT mode ────────────────────── File selection with branch targeting
     │
     ├── ↑/↓ ────── Highlight file (cursor)
     ├── Space ──── Rotate highlighted file's target branch forward
-    ├── m ──────── Back to MONITOR mode (restarts fatrace)
+    ├── Esc ────── Back to MONITOR mode (restarts fatrace)
     ├── 0-9 ────── Mark file's target branch
     ├── Shift+0-9  Mark all files above (higher iowait) → skip files with writes
     ├── - ──────── Clear mark
@@ -435,7 +435,7 @@ Color-coded by speed class: blue=HDD, teal=SSD, green=NVMe.
 │ 0:05:32  reads 4,812  writes 17  files 87  iowait 25.3(18.1)s  active 2                                │
 │ Est. iowait: 25.3s  Move time: ~2.1s  Space required: 0B                                               │
 │ Tiers:  nvme=10x(ssd)  ssd=4x(ssd)  r1=1x(hdd)  total(ro) 25.3s                                       │
-│ [↑↓] highlight  [Space] rotate  [m] monitor  [0-9] mark  [Enter] preview  [q] quit                       │
+│ [↑↓] highlight  [Space] rotate  [Esc] monitor  [0-9] mark  [Enter] preview  [q] quit                       │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ # FROM        TO     WRITES  IOWAIT    SIZE  FILE                                                        │
 │ 1  ssd   ──→  nvme       0  22.600  12.5MB  Data/textures/grass.dds                                      │
@@ -454,9 +454,12 @@ are shown in dim text (shift+# skips them).
 
 ### 7.4 User actions (SELECT mode)
 
+Navigation is consistent across all modes: **`Enter`** always advances one step,
+**`Esc`** always steps back, **`q`** always quits the program.
+
 - **↑ / ↓**: Move the highlight cursor to a file
 - **Space**: Rotate the highlighted file's target branch forward (cycles through branches)
-- **`m`**: Return to MONITOR mode (restarts fatrace)
+- **`Esc`**: Return to MONITOR mode (restarts fatrace)
 - **0-9**: Mark file's target branch (color-coded)
 - **Shift+0-9**: Mark all files above (higher iowait) — files with writes skipped
 - **`-`**: Clear mark on selected file
@@ -472,7 +475,7 @@ are shown in dim text (shift+# skips them).
 Pressing `Enter` in SELECT (with ≥1 marked file) opens a PREVIEW panel. Moves are
 listed in iowait-debt order, with FROM/TO columns color-coded by speed class and a
 per-file size plus a total. `Enter` confirms and calls `execute_move_plan()`;
-`Esc`/`q` returns to SELECT.
+`Esc` returns to SELECT; `q` quits without executing.
 
 ### 7.4.2 Post-move summary and free prompt
 

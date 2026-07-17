@@ -67,7 +67,7 @@ Hit `Space` or `Enter` when done to switch to SELECT mode (or `q` to quit).
 
 - Press `↑` / `↓` to highlight a file (cursor)
 - Press `Space` to rotate the highlighted file's target branch forward
-- Press `m` to return to MONITOR mode (restarts fatrace)
+- Press `Esc` to return to MONITOR mode (restarts fatrace)
 - Press `0-9` to mark a file's target branch (color-coded by speed class)
 - Press `Shift+0-9` to mark all files above (higher iowait)
 - Press `-` to clear a mark, `c` to clear session stats
@@ -76,7 +76,7 @@ Hit `Space` or `Enter` when done to switch to SELECT mode (or `q` to quit).
 
 On `Enter` a **PREVIEW** panel lists every planned move, ordered by iowait
 debt and color-coded by destination branch, with the total bytes to copy.
-`Enter` applies the moves; `Esc` returns to SELECT.
+`Enter` applies the moves; `Esc` returns to SELECT; `q` quits without applying.
 
 **3. Migrate** — files are copied to the target branch, verified (size), and
 the originals are renamed with a `_dimergio_` prefix. mergerfs now sees
@@ -274,14 +274,14 @@ collector._parse_line()          ─── ReadEvent (timestamp, proc, pid, uid,
     │
     └── TUI (MONITOR mode) ────── Read-only observation
                                     │
-                                    ├── Space ──── Stop → SELECT mode
-                                    └── Enter ──── Switch to SELECT mode
+                                    ├── Enter ──── Switch to SELECT mode
+                                    └── Esc/q ──── Quit
 
 SELECT mode ────────────────────── Branch marking + file selection
     │
     ├── ↑/↓ ────── Highlight file (cursor)
     ├── Space ──── Rotate highlighted file's target branch
-    ├── m ──────── Back to MONITOR mode (restarts fatrace)
+    ├── Esc ────── Back to MONITOR mode (restarts fatrace)
     ├── 0-9 ────── Mark target branch (color-coded)
     ├── Shift+0-9  Mark above (skip writes)
     ├── Enter ──── Preview → confirm → execute_move_plan()

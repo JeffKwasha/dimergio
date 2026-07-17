@@ -562,7 +562,7 @@ class Collector:
             )
 
             status = Text(status_text, style=status_style) if status_text else ""
-            sub = "Space:stop/resume  q:quit  s:show-exited  []:sample-rate  a:auto-quit  Enter:review files"
+            sub = "Enter:review files  Esc:quit  q:quit  s:show-exited  []:sample-rate  a:auto-quit  M:nand"
 
             return Panel(
                 Group(header, tiers_line, proc_table, file_table, tier_stats, status),
@@ -647,12 +647,12 @@ class Collector:
             elif clear_stats_at is not None:
                 status = Text("Press c again within 4s to clear session stats, any other key to cancel.", style="bold yellow")
             else:
-                status = Text("↑↓:highlight  Space:rotate branch  m:monitor  0-9:mark  Shift+0-9:mark above  -:clear  c:clear stats  Enter:preview  q:quit", style="dim")
+                status = Text("↑↓:highlight  Space:rotate  Esc:monitor  0-9:mark  Shift+0-9:mark above  -:clear  c:clear stats  Enter:review  q:quit", style="dim")
 
             return Panel(
                 Group(header, file_table, legend, space_line, status),
                 title=f"dimergio — {self.pool.mount}  [bold green]SELECT[/bold green]",
-                subtitle="↑↓:highlight  Space:rotate  m:monitor  0-9:mark  Enter:preview  q:quit",
+                subtitle="↑↓:highlight  Space:rotate  Esc:monitor  Enter:review  0-9:mark  q:quit",
                 border_style="dim",
             )
 
@@ -686,12 +686,12 @@ class Collector:
             header = Text.from_markup(
                 f"[bold]{len(pending_plans)} move(s)[/bold]  total {_fmt_bytes(total)}"
             )
-            status = Text("Enter: apply moves   Esc/q: back to select", style="bold yellow")
+            status = Text("Enter: execute   Esc: back to plan   q: quit", style="bold yellow")
 
             return Panel(
                 Group(header, table),
                 title=f"dimergio — {self.pool.mount}  [bold yellow]PREVIEW[/bold yellow]",
-                subtitle="Enter: apply  Esc: cancel",
+                subtitle="Enter: execute  Esc: back  q: quit",
                 border_style="yellow",
             )
 
@@ -703,7 +703,7 @@ class Collector:
             nonlocal auto_quit, nand_warn, quiesce_start, auto_detect_done, pending_plans
 
             if confirm_quit:
-                if key in ("y", "Y", "\r", "\n"):
+                if key in ("y", "Y"):
                     return True
                 confirm_quit = False
                 return False
@@ -721,27 +721,10 @@ class Collector:
         def _handle_monitor_key(key: str) -> bool:
             nonlocal mode, monitoring, auto_quit, nand_warn
 
-            if key == "q":
+            if key == "q" or key == "\x1b":
                 return True
             elif key == " ":
-                if proc_box[0] is None:
-                    return False
-                if monitoring:
-                    monitoring = False
-                    proc_box[0].terminate()
-                    proc_box[0].wait()
-                    read_thread.join(timeout=5)
-                    sampler.stop()
-                    mode = "select"
-                else:
-                    monitoring = True
-                    sampler.start()
-                    cmd = ["/usr/sbin/fatrace", "-f", "RW", "-u", "-t", "-t"]
-                    if self.use_sudo:
-                        cmd = ["sudo"] + cmd
-                    proc_box[0] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=str(self.pool.mount))
-                    assert proc_box[0].stdout is not None
-                return False
+                pass
             elif key == "\x1b[A":
                 pass
             elif key == "\x1b[B":
@@ -785,8 +768,11 @@ class Collector:
                     acc = sorted_f[file_selected]
                     tidx = file_marks.get(acc.path)
                     nxt = (acc.branch_idx + 1) % len(branches) if tidx is None else (tidx + 1) % len(branches)
-                    file_marks[acc.path] = nxt
-            elif key == "m" or key == "M":
+                    if nxt == acc.branch_idx:
+                        file_marks.pop(acc.path, None)
+                    else:
+                        file_marks[acc.path] = nxt
+            elif key == "\x1b":
                 if proc_box[0] is None:
                     return False
                 mode = "monitor"
@@ -807,10 +793,10 @@ class Collector:
                     file_scroll = file_selected - max_vis + 1
             elif key == "\x1b[5~":
                 file_scroll = max(0, file_scroll - max_vis)
-                file_selected = min(file_selected, file_scroll)
+                file_selected = file_scroll
             elif key == "\x1b[6~":
                 file_scroll = min(max(0, len(sorted_f) - max_vis), file_scroll + max_vis)
-                file_selected = max(file_selected, file_scroll)
+                file_selected = min(len(sorted_f) - 1, file_scroll + max_vis - 1)
             elif key == "\x1b[H":
                 file_scroll = 0
                 file_selected = 0
@@ -828,8 +814,8 @@ class Collector:
                 br_idx = int(key)
                 if br_idx < len(branches) and file_selected < len(sorted_f):
                     acc = sorted_f[file_selected]
-                    if file_marks.get(acc.path) == br_idx:
-                        del file_marks[acc.path]
+                    if br_idx == acc.branch_idx:
+                        file_marks.pop(acc.path, None)
                     else:
                         file_marks[acc.path] = br_idx
             elif key == "-":
@@ -866,9 +852,11 @@ class Collector:
             if key in ("\r", "\n"):
                 self.move_plans = pending_plans
                 return True
-            elif key in ("\x1b", "q", "Q", "c", "C", " "):
+            elif key == "\x1b":
                 mode = "select"
                 return False
+            elif key in ("q", "Q"):
+                return True
             return False
 
         # ─── Keyboard reader thread ─────────────────────────────────────
