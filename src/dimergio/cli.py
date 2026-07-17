@@ -155,8 +155,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 def cmd_cleanup(args: argparse.Namespace) -> None:
     ctx = PoolContext(args.pool)
     state = ctx.state
-    cfg = load_config()
-    days = cfg.get("cleanup_days", 14)
+    days = args.days if args.days is not None else 7
     entries = state.unverified(older_than_days=days)
 
     if not entries:
@@ -168,7 +167,11 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
         print(f"File: {e.pool_path}")
         print(f"  Orig: {e.source_branch} / {e.original_basename}  \u2192  {e.target_branch}")
         print(f"  Moved: {e.moved_at[:19]}")
-        ans = input("  Does your program still work? [Y/n/skip]: ").strip().lower()
+
+        if args.all:
+            ans = "y"
+        else:
+            ans = input("  Does your program still work? [Y/n/skip]: ").strip().lower()
 
         if ans in ("", "y", "yes"):
             branch_path = ctx.branch_path(e.source_branch)
@@ -442,6 +445,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     cp = sub.add_parser("cleanup", help="Verify old migrations and clean up originals")
     cp.add_argument("--pool", default=default_pool, help=pool_help)
+    cp.add_argument("-a", "--all", action="store_true", help="Clean all eligible migrations without prompting")
+    cp.add_argument("-d", "--days", nargs="?", type=int, const=0, default=None,
+                    help="Only consider migrations older than N days (default: 7; with -d but no number: 0)")
 
     up = sub.add_parser("undo", help="Undo migrations")
     up.add_argument("--pool", default=default_pool, help=pool_help)
