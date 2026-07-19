@@ -6,7 +6,13 @@ requires-python = ">=3.10"
 dependencies = [
     "rich>=13.0",
     "pyyaml>=6.0",
+    "readchar>=4.0",
 ]
 
 [project.scripts]
 dimergio = "dimergio.__main__:main"
+
+[tool.pyright]
+pythonPlatform = "Linux"
+venvPath = "."
+venv = ".venv"
