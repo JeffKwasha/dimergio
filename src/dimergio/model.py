@@ -3,6 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Assumed SSD physical block / minimum read-granularity (bytes). NAND pages are
+# 4K-16K and erase blocks 128K-256K+, so 128K is a reasonable floor for the
+# smallest unit of physical cost a read can incur on a typical consumer SSD.
+# Used purely as a normalization floor for cost comparison (iowait-per-MB), not
+# a physical constant — tune per device if needed.
+SSD_BLOCK_BYTES = 128 * 1024
+
 
 @dataclass(slots=True, unsafe_hash=True)
 class Branch:
@@ -102,6 +109,8 @@ class Candidate:
     cum_pct: float          # cumulative % across all candidates
     branch_name: str
     file_size: int
+    effective_size: int = 0     # file size rounded up to SSD block, min one block
+    iowait_per_mb: float = 0.0  # iowait_debt / (effective_size in MB)
 
     @property
     def size_display(self) -> str:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .collector import _effective_size_bytes
 from .model import AnalysisResult, Candidate, FileAccumulator, Pool
 
 
@@ -28,12 +29,17 @@ def analyze(
     for acc in accumulators.values():
         if not force_move and acc.branch_idx == fastest_idx:
             continue  # already on fastest branch
+        if acc.write_count > 0:
+            continue  # files written during observation are ineligible to move
 
         rel = _safe_relative(acc.path, dp)
         try:
             file_size = acc.path.stat().st_size
         except OSError:
             file_size = 0
+
+        effective_size = _effective_size_bytes(file_size)
+        iowait_per_mb = acc.iowait_debt / (effective_size / 1_000_000)
 
         total_reads += acc.total_reads
         total_iowait += acc.iowait_debt
@@ -47,6 +53,8 @@ def analyze(
             cum_pct=0.0,
             branch_name=pool.branches[acc.branch_idx].label,
             file_size=file_size,
+            effective_size=effective_size,
+            iowait_per_mb=iowait_per_mb,
         ))
 
     if not raw:
@@ -61,8 +69,8 @@ def analyze(
             pool=pool,
         )
 
-    # Sort by iowait debt descending
-    raw.sort(key=lambda c: c.iowait_debt, reverse=True)
+    # Sort by iowait cost per MB (byte-weighted) descending
+    raw.sort(key=lambda c: c.iowait_per_mb, reverse=True)
 
     # Compute percentages
     for c in raw:

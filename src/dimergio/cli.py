@@ -59,6 +59,16 @@ def cmd_watch(args: argparse.Namespace) -> None:
     cfg = load_config()
     iowait_ms = args.iowait_interval or cfg.get("iowait_interval_ms", 10)
 
+    debug_log = args.debug_log
+    if debug_log is True:
+        name = pool.name or pool.mount.name or "pool"
+        safe_name = name.strip("/").replace("/", "_") or "pool"
+        debug_log = Path(f"/tmp/dimergio_{safe_name}.log")
+    elif debug_log:
+        debug_log = Path(debug_log)
+    else:
+        debug_log = None
+
     if args.offline:
         if args.from_log:
             log_path = Path(args.from_log)
@@ -81,6 +91,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             data_path=data_path,
             no_interactive=args.no_interactive,
             preloaded=accumulators,
+            debug_log=debug_log,
         )
         collector.run()
 
@@ -99,6 +110,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             iowait_interval_ms=iowait_ms,
             no_interactive=args.no_interactive,
             verbose=args.verbose,
+            debug_log=debug_log,
         )
         accumulators = collector.run()
 
@@ -435,6 +447,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Disable interactive PID monitor (headless mode)")
     wp.add_argument("--verbose", "-v", action="store_true",
                     help="Log raw fatrace output and parsing decisions to stderr")
+    wp.add_argument("--debug-log", nargs="?", const=True, default=None,
+                    help="Write sampler debug log to PATH (default: /tmp/dimergio_<pool>.log)")
     wp.add_argument("--offline", action="store_true",
                     help="Use saved stats instead of live fatrace collection")
     wp.add_argument("--from-log", dest="from_log",
@@ -463,6 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
         verify=False,
         no_interactive=False,
         verbose=False,
+        debug_log=None,
         offline=False,
         from_log=None,
     )
