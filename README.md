@@ -54,10 +54,12 @@ dimergio spawns `fatrace -f RW -u -t -p <pid>`, samples `io_ticks` from
 `/sys/block/*/stat` at 100Hz, and merges each read/write event
 with the device busy% at that moment.
 
-The Rich TUI shows live process stats, file table, and tier summary.
-Hit `Enter` when done to switch to SELECT mode (or `q` to quit).
+The Rich TUI shows live process stats, file table, and tier summary on a
+single BROWSE screen. Observation and selection happen together — sampling
+runs continuously, so there is no separate monitor step. Press `Enter` to open
+the PREVIEW panel (or `q` to quit).
 
-**2. Select** — in SELECT mode, mark files for migration:
+**2. Select** — on the BROWSE screen, mark files for migration:
 
 ```
 # FROM        TO     WRITES  IOWAIT    SIZE  FILE
@@ -66,17 +68,21 @@ Hit `Enter` when done to switch to SELECT mode (or `q` to quit).
 ```
 
 - Press `↑` / `↓` to highlight a file (cursor)
+- Press `←` / `→` to rotate the sort column (IOW/MB → IOWAIT → READS; the active column is highlighted)
 - Press `Space` to rotate the highlighted file's target branch forward
-- Press `Esc` to return to MONITOR mode (restarts fatrace)
 - Press `0-9` to mark a file's target branch (color-coded by speed class)
 - Press `Shift+0-9` to mark all files above (higher iowait)
 - Press `-` to clear a mark, `c` to clear session stats
 - Press `Enter` to preview the moves (ordered, color-coded by branch)
-- Press `q` to quit (with confirmation if files are marked)
+- Press `q` twice within 4s to quit (first press shows a warning; any other key cancels)
+
+Files are ranked by **iowait cost per MB** (byte-weighted: file size rounded
+up to the 128 KiB SSD block floor), so large slow files outrank tiny ones with
+equal raw iowait. Files written during the run are excluded.
 
 On `Enter` a **PREVIEW** panel lists every planned move, ordered by iowait
 debt and color-coded by destination branch, with the total bytes to copy.
-`Enter` applies the moves; `Esc` returns to SELECT; `q` quits without applying.
+`Enter` applies the moves; `Esc` returns to BROWSE; `q` (twice) quits without applying.
 
 **3. Migrate** — files are copied to the target branch, verified (size), and
 the originals are renamed with a `_dimergio_` prefix. mergerfs now sees
@@ -272,20 +278,19 @@ collector._parse_line()          ─── ReadEvent (timestamp, proc, pid, uid,
     ├── collector._update_pid_stats() ── PidStat.read_count++, pid_iowait_sec[pid] += iowait_sec
     │                                    PidStat.write_count++ on W events
     │
-    └── TUI (MONITOR mode) ────── Read-only observation
+    └── TUI (BROWSE mode) ────── Live observation + selection on one screen
                                     │
-                                    ├── Enter ──── Switch to SELECT mode
+                                    ├── Enter ──── Open PREVIEW panel
                                     └── Esc/q ──── Quit
 
-SELECT mode ────────────────────── Branch marking + file selection
+BROWSE mode ────────────────────── Branch marking + file selection
     │
     ├── ↑/↓ ────── Highlight file (cursor)
-    ├── Space ──── Rotate highlighted file's target branch
-    ├── Esc ────── Back to MONITOR mode (restarts fatrace)
+    ├── Space ─── Rotate highlighted file's target branch
     ├── 0-9 ────── Mark target branch (color-coded)
     ├── Shift+0-9  Mark above (skip writes)
     ├── Enter ──── Preview → confirm → execute_move_plan()
-    └── q ──────── Quit (confirmation if marked)
+    └── q ──────── Quit (press twice within 4s)
 ```
 
 ## Key Concepts

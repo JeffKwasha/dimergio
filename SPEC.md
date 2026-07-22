@@ -34,7 +34,7 @@ benchmarking is performed. No assumptions are made about hardware latency.
          ├── __init__.py      Package version (0.1.1)
          ├── __main__.py      Entry point (python -m dimergio), logging config
          ├── pool.py          Mergerfs discovery from /proc, branch speed class auto-detection, PoolContext for unified identity and state access
-         ├── collector.py     fatrace subprocess, IOWait sampling, Rich TUI (MONITOR + SELECT modes),
+         ├── collector.py     fatrace subprocess, IOWait sampling, Rich TUI (BROWSE + PREVIEW modes),
          │                    process tracking, branch marking, file selection
          ├── model.py         Data classes (Pool, Branch, ReadEvent, FileAccumulator,
          │                    PidStat, Candidate, MovePlan, MoveEntry)
@@ -63,21 +63,20 @@ collector._parse_line()          ─── ReadEvent(timestamp, proc, pid, uid, 
     ├── collector._update_pid_stats() ── PidStat.read_count++, pid_iowait_sec[pid] += iowait_sec
     │                                    PidStat.write_count++ on W events
     │
-    └── TUI (MONITOR mode) ────── Read-only observation: process table, file table, tier stats
+    └── TUI (BROWSE mode) ────── Live observation + selection on one screen
                                      │
-                                     ├── Enter ──── Switch to SELECT mode
+                                     ├── Enter ──── Open PREVIEW panel
                                      └── Esc/q ──── Quit
 
-SELECT mode ────────────────────── File selection with branch targeting
+BROWSE mode ────────────────────── Live observation + branch targeting
     │
     ├── ↑/↓ ────── Highlight file (cursor)
     ├── Space ──── Rotate highlighted file's target branch forward
-    ├── Esc ────── Back to MONITOR mode (restarts fatrace)
     ├── 0-9 ────── Mark file's target branch
     ├── Shift+0-9  Mark all files above (higher iowait) → skip files with writes
     ├── - ──────── Clear mark
     ├── Enter ──── Preview moves (PREVIEW panel) → confirm → execute_move_plan()
-    ├── q ──────── Quit (confirmation if files marked)
+    ├── q ──────── Quit (press twice within 4s)
     └── PageUp/Down/Home/End ── Scroll
 ```
 
@@ -283,13 +282,12 @@ class PidStat:
 Process name resolution: read `/proc/<pid>/comm`, cache in PidStat.
 Fallback: use fatrace `comm` field (may be abbreviated for long names).
 
-### 5.8 Auto-quit
+### 5.8 Auto-quit (passive mode only)
 
-Default in interactive mode: OFF. User toggles with `a` key on monitor screen.
-
-If `--pid PID` is given (passive mode): auto-quit ON by default.
-If `--process NAME` is given (passive mode): auto-quit ON by default.
-`--auto-quit` CLI flag explicitly enables it for interactive mode.
+When `--pid PID` or `--process NAME` is given, the collector runs in passive
+mode (`_run_passive`) and auto-quits when the known target process exits.
+Interactive mode has no auto-quit; the user quits manually (press `q` twice
+within 4s). Stats are persisted on quit regardless.
 
 On stop:
 1. TERM the fatrace subprocess
@@ -389,60 +387,66 @@ Estimated time saved: 45.2s per observation session.
 
 ### 7.1 Display
 
-A full-screen Rich TUI using `Live(screen=True, get_renderable=)` at 1-2 Hz.
-Keyboard input on a separate daemon thread (own termios), isolated from Rich I/O.
+A full-screen Rich TUI using `Live(screen=True, get_renderable=)` at 4 Hz.
+Keyboard input on a separate daemon thread via `readchar`, isolated from Rich I/O.
 
-Two modes: **MONITOR** (during observation) and **SELECT** (after observation).
+A single merged **BROWSE** screen replaces the old MONITOR/SELECT split. fatrace
+sampling runs continuously for the whole session, so there is no separate
+"monitor mode" to switch into and no fatrace respawn (and thus no reader-thread
+desync). The screen shows the live process table when monitoring is active, the
+navigable file table with FROM/TO target columns, tier stats, and the marking
+estimate. `Enter` opens the **PREVIEW** panel.
 
-### 7.2 MONITOR mode (during observation)
+### 7.2 BROWSE mode (live observation + selection)
 
 Shows live-updating file table, process stats, and tier summary:
 
 ```
-╭─ dimergio — <pool> — MONITOR ───────────────────────────────────────────────────────────────────────────╮
-│ 0:05:32  reads 4,812  writes 17  files 87  iowait 25.3(18.1)s  active 2  sample 10ms(100Hz)            │
-│ Tiers:  nvme=10x(ssd)  ssd=4x(ssd)  r1=1x(hdd)  total(ro) 25.3s                                       │
-│ Watching: /mnt/@/ssd_games /mnt/@/r1_games                                                              │
-│ [a] auto-quit:OFF  [Space] stop & select  [Enter] select  [q] quit                                      │
-├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+╭─ dimergio — <pool> — BROWSE ───────────────────────────────────────────────────────────────────────────╮
+│ 0:05:32  reads 4,812  writes 17  files 87  marked 0  sample 10ms(100Hz)                                 │
+│ Tiers:  0:nvme(10x)  1:ssd(4x)  2:r1(1x)   M:nand:ON                                                     │
 │ PROCESS              READS  WRITES  IOWAIT  STATUS                                                       │
 │ everspace2.exe        3,923      12  12.348  run                                                          │
 │ wineserver              877       0   2.104  run                                                          │
 │ signal-desktop           12       5   0.032  run                                                          │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ # READS   IOWAIT    SIZE   BRANCH  FILE                                                                  │
-│ 1 4,521  22.600  12.5MB   ssd     Data/textures/grass.dds                                                │
-│ 2 3,892  19.500   438MB   r1      Data/meshes/rock.nif                                                   │
-│ 3 2,891  14.500  2.1GB    r1      Data/main.ba2                                                          │
-│ 4 2,100   8.200  128MB    ssd     Data/sounds/music.pak                                                  │
-│ 5 1,800   7.100   64MB    r1      Data/shaders/compiled.glsl                                              │
+│ # READS   IOWAIT    FROM     TO     FILE                                                                 │
+│ 1 4,521  22.600    ssd   ──→  nvme   Data/textures/grass.dds                                            │
+│ 2 3,892  19.500    r1    ──→  ssd    Data/meshes/rock.nif                                               │
+│ 3 2,891  14.500    r1    ──→  ssd    Data/main.ba2                                                       │
+│ 4 2,100   8.200    ssd   ──→  nvme   Data/sounds/music.pak                                              │
+│ 5 1,800   7.100    r1    ──→  ssd    Data/shaders/compiled.glsl                                          │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ Tier: reads  nvme    0 (0%)  ssd 2,400 (50%)  r1 2,412 (50%)                                              │
 │       iowait  nvme 0.0s(0%)  ssd  7.2s(28%)  r1 18.1s(72%)                                              │
+│ est. iowait saved 25.3s   est. move time 2.1s   space required  nvme 2.1GB  ssd 566MB                  │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-Read-only during monitoring. No actions, no selection. Press `q` to quit (with
-confirmation). Press `Space` or `Enter` to stop monitoring and switch to SELECT mode.
+Observation and selection happen on one screen. Press `q` twice within 4s to quit.
+Press `Enter` to open the PREVIEW panel and review the planned moves. While
+monitoring is active the process table is shown; for preloaded/saved sessions it
+is omitted.
 
-### 7.3 SELECT mode (after observation)
+### 7.3 PREVIEW panel
+
+Pressing `Enter` (with ≥1 marked file) opens a PREVIEW panel. Moves are listed
+in iowait-debt order, with FROM/TO columns color-coded by speed class and a
+per-file size plus a total. `Enter` confirms and calls `execute_move_plan()`;
+`Esc` returns to BROWSE; `q` (twice within 4s) quits without executing.
 
 File selection with branch targeting. Each file gets a FROM (current) and TO (target) column.
 Color-coded by speed class: blue=HDD, teal=SSD, green=NVMe.
 
 ```
-╭─ dimergio — <pool> — SELECT ────────────────────────────────────────────────────────────────────────────╮
-│ 0:05:32  reads 4,812  writes 17  files 87  iowait 25.3(18.1)s  active 2                                │
-│ Est. iowait: 25.3s  Move time: ~2.1s  Space required: 0B                                               │
-│ Tiers:  nvme=10x(ssd)  ssd=4x(ssd)  r1=1x(hdd)  total(ro) 25.3s                                       │
-│ [↑↓] highlight  [Space] rotate  [Esc] monitor  [0-9] mark  [Enter] preview  [q] quit                       │
-├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ # FROM        TO     WRITES  IOWAIT    SIZE  FILE                                                        │
-│ 1  ssd   ──→  nvme       0  22.600  12.5MB  Data/textures/grass.dds                                      │
-│ 2  r1    ──→  ssd        0  19.500   438MB  Data/meshes/rock.nif                                         │
-│ 3  r1    ──→  ssd        3  14.500  2.1GB  Data/main.ba2                                                 │
-│ 4  ssd   ──→  nvme       0   8.200  128MB  Data/sounds/music.pak                                          │
-│ 5  r1    ──→  ssd        0   7.100   64MB  Data/shaders/compiled.glsl                                     │
+╭─ dimergio — <pool> — PREVIEW ──────────────────────────────────────────────────────────────────────────╮
+│ 5 move(s)  total 3.2GB                                                                                      │
+│ # FROM        TO     FILE                                                                 SIZE             │
+│ 1  ssd   ──→  nvme   Data/textures/grass.dds                                       12.5MB              │
+│ 2  r1    ──→  ssd    Data/meshes/rock.nif                                          438MB               │
+│ 3  r1    ──→  ssd    Data/main.ba2                                               2.1GB                │
+│ 4  ssd   ──→  nvme   Data/sounds/music.pak                                       128MB                │
+│ 5  r1    ──→  ssd    Data/shaders/compiled.glsl                                    64MB                │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ Tier: reads  nvme    0 (0%)  ssd 2,400 (50%)  r1 2,412 (50%)                                              │
 │       iowait  nvme 0.0s(0%)  ssd  7.2s(28%)  r1 18.1s(72%)                                              │
@@ -452,30 +456,42 @@ Color-coded by speed class: blue=HDD, teal=SSD, green=NVMe.
 FROM shows `...` if file exists on multiple branches (prefixed). Files with writes > 0
 are shown in dim text (shift+# skips them).
 
-### 7.4 User actions (SELECT mode)
+### 7.4 User actions (BROWSE mode)
 
-Navigation is consistent across all modes: **`Enter`** always advances one step,
-**`Esc`** always steps back, **`q`** always quits the program.
+Navigation is consistent across the whole TUI: **`Enter`** always advances one step
+(opens PREVIEW), **`Esc`** in PREVIEW returns to BROWSE, **`q`** always quits the
+program (press twice within 4s; the first press shows a warning, any other key
+cancels).
 
 - **↑ / ↓**: Move the highlight cursor to a file
+- **← / →**: Rotate the active sort column (IOW/MB → IOWAIT → READS, wraps). The active column is highlighted in the table header.
 - **Space**: Rotate the highlighted file's target branch forward (cycles through branches)
-- **`Esc`**: Return to MONITOR mode (restarts fatrace)
 - **0-9**: Mark file's target branch (color-coded)
 - **Shift+0-9**: Mark all files above (higher iowait) — files with writes skipped
 - **`-`**: Clear mark on selected file
 - **`Enter`**: Open PREVIEW panel (ordered, branch-color-coded list + total bytes)
-- **`q`**: Quit (confirmation if files are marked)
+- **`q`**: Quit (press twice within 4s to confirm)
 - **PageUp/PageDown**: Scroll by visible rows
 - **Home/End**: Jump to top/bottom
 - **`[`**: Decrease sample interval by 5ms (faster, min 5ms)
 - **`]`**: Increase sample interval by 5ms (slower)
+- **`s`**: Toggle showing exited processes in the process table
+- **`M`**: Toggle NAND-source warning
+
+The file list is ranked by **iowait cost per physical MB** (the default sort
+column), not raw iowait seconds. Each file's size is rounded up to the SSD
+block size (`SSD_BLOCK_BYTES = 128 KiB`, the assumed minimum physical read
+cost) to derive an effective size; `iowait_per_mb = iowait_debt / effective_MB`.
+This byte-weights the ranking so a large, slow file outranks a tiny one with
+equal raw iowait. Files written during the observation run are excluded from
+the list and can never be marked.
 
 ### 7.4.1 PREVIEW panel
 
-Pressing `Enter` in SELECT (with ≥1 marked file) opens a PREVIEW panel. Moves are
+Pressing `Enter` in BROWSE (with ≥1 marked file) opens a PREVIEW panel. Moves are
 listed in iowait-debt order, with FROM/TO columns color-coded by speed class and a
 per-file size plus a total. `Enter` confirms and calls `execute_move_plan()`;
-`Esc` returns to SELECT; `q` quits without executing.
+`Esc` returns to BROWSE; `q` (twice within 4s) quits without executing.
 
 ### 7.4.2 Post-move summary and free prompt
 
