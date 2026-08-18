@@ -483,5 +483,6 @@ def build_parser() -> argparse.ArgumentParser:
         debug_log=None,
         offline=False,
         from_log=None,
+        mmap_pid=[],
     )
     return parser

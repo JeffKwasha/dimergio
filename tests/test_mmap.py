@@ -189,3 +189,23 @@ def test_set_interval_sends_i_command():
         w.set_interval_ms(33)
     assert "i 33\n" in fake_proc.stdin.getvalue()
     w.stop()
+
+
+# ─── CLI: bare `dimergio` must still expose watch defaults ─────────
+def test_parser_no_args_exposes_mmap_pid():
+    """`dimergio` with no subcommand runs cmd_watch, so every watch default
+    must exist on the namespace (set via parser.set_defaults). Regression for
+    AttributeError 'Namespace' object has no attribute 'mmap_pid'."""
+    from dimergio.cli import build_parser
+
+    ns = build_parser().parse_args([])
+    assert ns.command is None
+    assert ns.mmap_pid == []
+
+
+def test_parser_watch_mmap_pid_accumulates():
+    from dimergio.cli import build_parser
+
+    ns = build_parser().parse_args(["watch", "--mmap-pid", "42", "--mmap-pid", "43"])
+    assert ns.command == "watch"
+    assert ns.mmap_pid == [42, 43]
