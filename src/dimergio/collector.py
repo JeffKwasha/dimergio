@@ -12,7 +12,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .model import Branch, FileAccumulator, PidStat, Pool, ReadEvent, SSD_BLOCK_BYTES
+from .model import FileAccumulator, PidStat, Pool, ReadEvent, SSD_BLOCK_BYTES
+from .pool import IO_Domain
 
 logger = logging.getLogger(__name__)
 
@@ -157,26 +158,34 @@ def _read_diskstats() -> dict[str, int]:
 class IOWaitSampler:
     """Samples per-device I/O busy-time and attributes it to read events.
 
-    Each polling window's delta ``io_ticks`` is added to a pending bucket.
-    Every read event consumes an equal share of the pending bucket, so I/O
-    wait is attributed to the events that arrived during the busy window
-    instead of being lagged by one sample or zeroed between bursts.
+    Branches are grouped into *IO domains* — all branches on the same set of
+    physical block devices (i.e. same btrfs pool) share one domain.  Each
+    polling window's delta ``io_ticks`` across *every* device in a domain is
+    summed into the domain's pending bucket.  At the next sample the bucket
+    is divided evenly among the read events that arrived during the window
+    and set as the per-event share for the *following* window (one-window
+    lag), providing fair attribution across concurrent events.
     """
 
     MIN_INTERVAL_MS = 5
 
     def __init__(
         self,
-        branches: list[Branch],
+        domains: list[IO_Domain],
+        br2domain: list[int],
         interval_ms: int = 10,
         debug_log: Path | None = None,
     ):
-        self._branches = branches
+        self._domains = domains
+        self._br2domain = br2domain
         self._interval_ms = interval_ms
         self._interval = interval_ms / 1000
-        self._pending_ms: dict[int, float] = {i: 0.0 for i in range(len(branches))}
-        self._event_counts: dict[int, int] = {i: 0 for i in range(len(branches))}
-        self._prev_ticks: dict[int, int] = {}
+        nd = len(domains)
+        self._pending_ms: list[float] = [0.0] * nd
+        self._event_counts: list[int] = [0] * nd
+        self._share_ms: list[float] = [0.0] * nd
+        self._prev_ticks: dict[str, int] = {}
+        self._total_iowait_ms: float = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -185,7 +194,7 @@ class IOWaitSampler:
         if debug_log is not None:
             try:
                 self._debug_fh = open(debug_log, "w", encoding="utf-8")
-                self._debug_fh.write("timestamp branch device delta_ms pending_ms events\n")
+                self._debug_fh.write("timestamp domain devices pending_ms share_ms events\n")
                 self._debug_fh.flush()
             except OSError as exc:
                 logger.warning("Cannot open debug log %s: %s", debug_log, exc)
@@ -195,14 +204,20 @@ class IOWaitSampler:
     def interval_ms(self) -> int:
         return self._interval_ms
 
+    @property
+    def total_iowait_sec(self) -> float:
+        """Cumulative wall-clock device-busy time across all domains (seconds)."""
+        return self._total_iowait_ms / 1000.0
+
     def set_interval_ms(self, ms: int) -> None:
         ms = max(self.MIN_INTERVAL_MS, ms)
         self._interval_ms = ms
         self._interval = ms / 1000
 
     def record_event(self, branch_idx: int) -> None:
+        domain_idx = self._br2domain[branch_idx]
         with self._lock:
-            self._event_counts[branch_idx] += 1
+            self._event_counts[domain_idx] += 1
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -221,25 +236,20 @@ class IOWaitSampler:
             fh.close()
 
     def get_busy(self, branch_idx: int) -> float:
-        """Return this event's share of pending I/O wait time in seconds.
+        """Return this event's pre-computed share of pending I/O wait (seconds).
 
-        The pending bucket is divided evenly among the events that have
-        been recorded but not yet charged.
+        The share was computed at the last sampling tick by dividing the
+        previous window's accumulated device busy time evenly among the
+        events that arrived during that window (one-window lag).
         """
-        with self._lock:
-            cnt = self._event_counts.get(branch_idx, 0)
-            if cnt <= 0:
-                return 0.0
-            pending = self._pending_ms.get(branch_idx, 0.0)
-            share = pending / cnt
-            self._pending_ms[branch_idx] = pending - share
-            self._event_counts[branch_idx] = cnt - 1
-            return share / 1000.0
+        domain_idx = self._br2domain[branch_idx]
+        return self._share_ms[domain_idx] / 1000.0
 
     def _run(self) -> None:
         initial = _read_diskstats()
-        for i, branch in enumerate(self._branches):
-            self._prev_ticks[i] = initial.get(branch.device, 0)
+        for domain in self._domains:
+            for dev in domain.devices:
+                self._prev_ticks[dev] = initial.get(dev, 0)
 
         while not self._stop.is_set():
             self._stop.wait(self._interval)
@@ -247,21 +257,35 @@ class IOWaitSampler:
             stats = _read_diskstats()
             timestamp = datetime.datetime.now().isoformat()
             with self._lock:
-                for i, branch in enumerate(self._branches):
-                    curr = stats.get(branch.device)
-                    if curr is None:
-                        continue
-                    prev = self._prev_ticks.get(i, curr)
-                    delta_ms = curr - prev
-                    self._prev_ticks[i] = curr
-                    if delta_ms < 0:
-                        # Counter wrapped or device reset; discard this tick.
-                        continue
-                    self._pending_ms[i] += delta_ms
+                for domain_idx, domain in enumerate(self._domains):
+                    total_delta = 0
+                    for dev in domain.devices:
+                        curr = stats.get(dev)
+                        if curr is None:
+                            continue
+                        prev = self._prev_ticks.get(dev, curr)
+                        self._prev_ticks[dev] = curr
+                        delta = curr - prev
+                        if delta >= 0:
+                            total_delta += delta
+
+                    self._pending_ms[domain_idx] += total_delta
+                    self._total_iowait_ms += total_delta
+
+                    cnt = self._event_counts[domain_idx]
+                    if cnt > 0:
+                        self._share_ms[domain_idx] = self._pending_ms[domain_idx] / cnt
+                    else:
+                        self._share_ms[domain_idx] = 0.0
+
+                    self._pending_ms[domain_idx] = 0.0
+                    self._event_counts[domain_idx] = 0
+
                     if self._debug_fh is not None:
                         self._debug_fh.write(
-                            f"{timestamp} {i} {branch.device} {delta_ms} "
-                            f"{self._pending_ms[i]:.1f} {self._event_counts[i]}\n"
+                            f"{timestamp} {domain_idx} {','.join(domain.devices)} "
+                            f"{self._pending_ms[domain_idx]:.1f} "
+                            f"{self._share_ms[domain_idx]:.3f} {cnt}\n"
                         )
                         self._debug_fh.flush()
 
@@ -471,7 +495,7 @@ class Collector:
                 and sys.stdin.isatty()
             )
             if use_interactive:
-                sampler = IOWaitSampler([], debug_log=self._debug_log)
+                sampler = IOWaitSampler([], [], debug_log=self._debug_log)
                 self._sampler = sampler
                 sampler.start()
                 self._run_interactive(sampler=sampler, start_in_select=True)
@@ -481,8 +505,11 @@ class Collector:
             logger.info("done (preloaded) — %d reads, %d files", nreads, nfiles)
             return self._accumulators
 
+        from .pool import _build_io_domains
+
+        domains, br2domain = _build_io_domains(self.pool.branches)
         sampler = IOWaitSampler(
-            self.pool.branches, self.iowait_interval_ms, debug_log=self._debug_log
+            domains, br2domain, self.iowait_interval_ms, debug_log=self._debug_log
         )
         sampler.start()
         self.start_fatrace(sampler)
@@ -749,7 +776,8 @@ class Collector:
                 f"[bold]writes[/bold] {n_writes}  "
                 f"[bold]files[/bold] {n_files}  "
                 f"[bold]marked[/bold] {n_marked}  "
-                f"[bold]sample[/bold] {sampler.interval_ms}ms({hz:.0f}Hz)"
+                f"[bold]sample[/bold] {sampler.interval_ms}ms({hz:.0f}Hz)  "
+                f"[bold cyan]ΔIO: {sampler.total_iowait_sec:.1f}s[/bold cyan]"
             )
 
             tiers_line = Text.from_markup(

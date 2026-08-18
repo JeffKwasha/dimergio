@@ -3,10 +3,16 @@ from __future__ import annotations
 import os
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from .model import Branch, Pool
 from .state import StateManager
+
+
+@dataclass
+class IO_Domain:
+    devices: list[str]
 
 
 def discover_pools() -> list[Pool]:
@@ -135,6 +141,68 @@ def _dm_name(device_path: str) -> str | None:
         except OSError:
             pass
     return None
+
+
+def _resolve_btrfs_devices(branch_path: Path) -> list[str]:
+    """Return all dm-X device names backing the btrfs pool at branch_path.
+
+    For non-btrfs mounts this returns the single device (or [] if un-resolvable).
+    """
+    resolved = branch_path.resolve()
+    mount_source = None
+    with open("/proc/mounts") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            mp = Path(parts[1]).resolve()
+            if mp == resolved:
+                mount_source = parts[0]
+                break
+    if mount_source is None:
+        return []
+
+    dm_name = _dm_name(mount_source)
+    if dm_name is None:
+        return []
+
+    btrfs_root = Path("/sys/fs/btrfs")
+    try:
+        for fsid_dir in btrfs_root.iterdir():
+            if not fsid_dir.is_dir() or fsid_dir.name == "features":
+                continue
+            devices_dir = fsid_dir / "devices"
+            if not devices_dir.is_dir():
+                continue
+            if (devices_dir / dm_name).exists():
+                return sorted(d.name for d in devices_dir.iterdir() if d.is_dir())
+    except OSError:
+        pass
+
+    return [dm_name]
+
+
+def _build_io_domains(branches: list[Branch]) -> tuple[list[IO_Domain], list[int]]:
+    """Group branches by their backing device set.
+
+    Returns (domains, br2domain) where br2domain[i] = domain index for branch i.
+    Branches on the same btrfs pool share a domain.
+    """
+    branch_devices: list[list[str]] = [_resolve_btrfs_devices(b.path) for b in branches]
+    seen: dict[tuple[str, ...], int] = {}
+    domains: list[IO_Domain] = []
+    br2domain: list[int] = []
+
+    for devs in branch_devices:
+        key = tuple(devs)
+        idx = seen.get(key)
+        if idx is None:
+            idx = len(domains)
+            domains.append(IO_Domain(devices=list(devs)))
+            seen[key] = idx
+        br2domain.append(idx)
+
+    return domains, br2domain
 
 
 class PoolContext:
