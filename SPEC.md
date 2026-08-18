@@ -77,7 +77,8 @@ BROWSE mode ────────────────────── L
     ├── - ──────── Clear mark
     ├── Enter ──── Preview moves (PREVIEW panel) → confirm → execute_move_plan()
     ├── q ──────── Quit (press twice within 4s)
-    └── PageUp/Down/Home/End ── Scroll
+    ├── PageUp/Down ── Scroll focused list
+    └── Home/End ──── Switch focus (Home: process list, End: file list)
 ```
 
 ## 4. Pool Discovery (pool.py)
@@ -405,10 +406,11 @@ Shows live-updating file table, process stats, and tier summary:
 ╭─ dimergio — <pool> — BROWSE ───────────────────────────────────────────────────────────────────────────╮
 │ 0:05:32  reads 4,812  writes 17  files 87  marked 0  sample 10ms(100Hz)                                 │
 │ Tiers:  0:nvme(10x)  1:ssd(4x)  2:r1(1x)   M:nand:ON                                                     │
-│ PROCESS              READS  WRITES  IOWAIT  STATUS                                                       │
-│ everspace2.exe        3,923      12  12.348  run                                                          │
-│ wineserver              877       0   2.104  run                                                          │
-│ signal-desktop           12       5   0.032  run                                                          │
+│ PROCESS              READS     MMAP  IOWAIT  STATUS                                                       │
+│ llama-server            0    6.8GB   2.012  watch                                                         │
+│ everspace2.exe        3,923        -  12.348  run                                                          │
+│ wineserver              877        -   2.104  run                                                          │
+│ signal-desktop           12        -   0.032  exited                                                       │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ # READS   IOWAIT    FROM     TO     FILE                                                                 │
 │ 1 4,521  22.600    ssd   ──→  nvme   Data/textures/grass.dds                                            │
@@ -471,12 +473,39 @@ cancels).
 - **`-`**: Clear mark on selected file
 - **`Enter`**: Open PREVIEW panel (ordered, branch-color-coded list + total bytes)
 - **`q`**: Quit (press twice within 4s to confirm)
-- **PageUp/PageDown**: Scroll by visible rows
-- **Home/End**: Jump to top/bottom
+- **PageUp/PageDown**: Scroll the focused list by visible rows
+- **Home / End**: Switch focus — `Home` to the process list, `End` back to the file list (they no longer scroll within a list)
 - **`[`**: Decrease sample interval by 5ms (faster, min 5ms)
 - **`]`**: Increase sample interval by 5ms (slower)
 - **`s`**: Toggle showing exited processes in the process table
 - **`M`**: Toggle NAND-source warning
+- **`m`**: Scan for mmap-reading candidate PIDs and focus the process list
+
+### 7.4.0.1 mmap read detection
+
+fanotify (and therefore fatrace) does not report accesses that happen through
+`mmap`, so a llama.cpp model load or an emulator loading assets leaves no trace
+in dimergio. A CO-RE eBPF tracer (`src/dimergio/bin/dimergio-mmap`, a kprobe on
+`filemap_fault`) counts page faults per `(pid, inode)` and streams aggregated
+windows (`<pid> <ino> <count>`) over stdin/stdout to the collector, which maps
+the inode back to a path via `/proc/<pid>/maps` (cached per pid) and folds each
+fault into the normal accumulation pipeline (per-file reads + iowait share,
+sampler event counts, PID stats).
+
+- Press **`m`** to scan `/proc/<pid>/io` `read_bytes` for processes whose file
+  mappings fall under the watched data path. Candidates are sorted by that
+  monotonic counter (stable across scans), not by a rate. `m` also switches
+  focus to the process list.
+- With the process list focused, **↑/↓** moves the cursor and **`Enter`**
+  toggles mmap watching for the highlighted process. Status column values:
+  `run` (fatrace reads), `exited`, `cand` (mmap candidate), `watch` (currently
+  traced). The MMAP column shows the candidate's total `read_bytes`.
+- Start PIDs from the command line with `--mmap-pid <pid>` (repeatable), e.g.
+  `dimergio watch --mmap-pid $(pgrep llama-server)`.
+- The tracer is a single statically linked x86-64 binary that works on any
+  kernel with BTF (CO-RE). If it is missing or running without privileges,
+  `m` shows a notice and mmap detection is a no-op — the tool still works on
+  fatrace reads alone. `[`/`]` keep the tracer window in sync with the sampler.
 
 The file list is ranked by **iowait cost per physical MB** (the default sort
 column), not raw iowait seconds. Each file's size is rounded up to the SSD
@@ -505,7 +534,8 @@ one file was moved, even if zero bytes were copied (rename-only moves).
 ### 7.5 Scrolling
 
 Visible rows clamped to 8-25 based on terminal height. Scroll position tracked
-via `_file_scroll` offset. Arrow keys, PageUp/PageDown, Home/End navigate.
+via `_file_scroll` offset. Arrow keys and PageUp/PageDown scroll the focused
+list; the process list uses the same `_apply_nav` helper with an 8-row window.
 
 ### 7.6 NAND source warning
 

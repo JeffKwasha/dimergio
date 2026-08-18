@@ -4,3 +4,9 @@ __pycache__/
 .pytest_cache/
 *.swp
 *.swo
+
+# eBPF build artifacts (the committed binary lives in src/dimergio/bin/)
+src/dimergio/bpf/vmlinux.h
+src/dimergio/bpf/*.bpf.o
+src/dimergio/bpf/*.skel.h
+src/dimergio/bpf/mmap_tracer

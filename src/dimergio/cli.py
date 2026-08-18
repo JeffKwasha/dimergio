@@ -111,6 +111,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             no_interactive=args.no_interactive,
             verbose=args.verbose,
             debug_log=debug_log,
+            mmap_pids=args.mmap_pid,
         )
         accumulators = collector.run()
 
@@ -437,6 +438,8 @@ def build_parser() -> argparse.ArgumentParser:
     wp.add_argument("--process",
                     help="Auto-quit when this process exits (matches /proc/<pid>/cmdline)")
     wp.add_argument("--pid", type=int, help="Auto-quit when this PID exits")
+    wp.add_argument("--mmap-pid", type=int, action="append", default=[],
+                    help="Watch mmap page-fault reads of this PID (repeatable; needs dimergio-mmap)")
     wp.add_argument("--no-sudo", dest="sudo", action="store_false",
                     help="Run fatrace without sudo (requires CAP_SYS_ADMIN on fatrace binary)")
     wp.add_argument("--iowait-interval", type=int, default=10,

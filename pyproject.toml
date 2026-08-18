@@ -12,6 +12,17 @@ dependencies = [
 [project.scripts]
 dimergio = "dimergio.__main__:main"
 
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+dimergio = [
+    "bin/dimergio-mmap",
+    "bpf/mmap_tracer.c",
+    "bpf/mmap_tracer.bpf.c",
+    "bpf/Makefile",
+]
+
 [tool.pyright]
 pythonPlatform = "Linux"
 venvPath = "."

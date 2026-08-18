@@ -75,6 +75,18 @@ the PREVIEW panel (or `q` to quit).
 - Press `-` to clear a mark, `c` to clear session stats
 - Press `Enter` to preview the moves (ordered, color-coded by branch)
 - Press `q` twice within 4s to quit (first press shows a warning; any other key cancels)
+- Press `[` / `]` to slow down / speed up the iowait sampling rate (5ms steps)
+
+**Watching mmap readers.** Programs that load files with `mmap` (llama.cpp
+model loaders, many emulators, data loaders) never show up in fatrace — the
+kernel's fanotify API does not report mmap accesses. dimergio detects them
+with a small eBPF tracer (`src/dimergio/bin/dimergio-mmap`, a CO-RE
+`filemap_fault` kprobe that counts page faults per PID/inode). Press `m` to
+scan for candidate PIDs, then `Home` to focus the process list. `Enter` on a
+process toggles watching its mmap faults; watched faults are folded into the
+same per-file iowait/read ranking as fatrace reads. `End` returns focus to the
+file list. Without the tracer (or without root), mmap detection degrades to a
+no-op and `m` shows a notice.
 
 Files are ranked by **iowait cost per MB** (byte-weighted: file size rounded
 up to the 128 KiB SSD block floor), so large slow files outrank tiny ones with

@@ -79,8 +79,10 @@ def test_nav_scroll_follows_selection():
 def test_nav_page_home_end():
     assert _apply_nav(0, 0, 10, 5, "page_down") == (5, 9)
     assert _apply_nav(5, 9, 10, 5, "page_up") == (0, 0)
-    assert _apply_nav(0, 0, 10, 5, "end") == (5, 9)
-    assert _apply_nav(5, 9, 10, 5, "home") == (0, 0)
+    # Home/End no longer scroll lists — they switch focus between the file
+    # and process lists, so _apply_nav ignores them.
+    assert _apply_nav(0, 0, 10, 5, "end") == (0, 0)
+    assert _apply_nav(5, 9, 10, 5, "home") == (5, 9)
 
 
 def test_nav_unknown_key_leaves_state_unchanged():
@@ -89,7 +91,7 @@ def test_nav_unknown_key_leaves_state_unchanged():
 
 def test_nav_empty_list_is_safe():
     assert _apply_nav(0, 0, 0, 5, "down") == (0, 0)
-    assert _apply_nav(0, 0, 0, 5, "end") == (0, 0)
+    assert _apply_nav(0, 0, 0, 5, "page_down") == (0, 0)
 
 
 # ─── Navigation keys are identical in monitor and select modes ──────
@@ -98,7 +100,7 @@ def test_nav_kind_mapping_is_complete():
     from dimergio.collector import _Keys
 
     nav_kind = _Keys().NAV
-    for kind in ("up", "down", "page_up", "page_down", "home", "end"):
+    for kind in ("up", "down", "page_up", "page_down"):
         assert any(v == kind for v in nav_kind.values())
 
 

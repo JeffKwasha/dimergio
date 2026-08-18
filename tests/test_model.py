@@ -74,6 +74,24 @@ class TestFileAccumulator:
         assert acc.total_reads == 1
         assert acc.iowait_debt == 0.0
 
+    def test_observe_n_counts_aggregated_events(self):
+        # Aggregated mmap page-fault windows: N faults == N reads.
+        acc = FileAccumulator(path=Path("/f"), branch_idx=0)
+        acc.observe_n(100.0, 50.0, 5)
+        assert acc.total_reads == 5
+        assert acc.iowait_debt == 250.0
+        assert acc.first_seen == 100.0
+        assert acc.last_seen == 100.0
+
+    def test_observe_n_keeps_first_seen(self):
+        acc = FileAccumulator(path=Path("/f"), branch_idx=0)
+        acc.observe_n(100.0, 0.0, 2)
+        acc.observe_n(200.0, 1.0, 3)
+        assert acc.total_reads == 5
+        assert acc.iowait_debt == 3.0
+        assert acc.first_seen == 100.0
+        assert acc.last_seen == 200.0
+
 
 class TestCandidate:
     def test_size_display_bytes(self):

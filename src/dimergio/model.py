@@ -79,8 +79,13 @@ class FileAccumulator:
     target_branch_idx: int | None = None  # marks intent for SELECT mode
 
     def observe(self, ts: float, iowait_sec: float) -> None:
-        self.total_reads += 1
-        self.iowait_debt += iowait_sec
+        self.observe_n(ts, iowait_sec, 1)
+
+    def observe_n(self, ts: float, iowait_sec: float, n: int) -> None:
+        """Record ``n`` read events in one call (used for aggregated mmap
+        page-fault windows where each fault is one read)."""
+        self.total_reads += n
+        self.iowait_debt += iowait_sec * n
         if not self.first_seen:
             self.first_seen = ts
         self.last_seen = ts
