@@ -191,6 +191,49 @@ def test_set_interval_sends_i_command():
     w.stop()
 
 
+# ─── tracer must never touch the TUI's terminal ─────────────────────
+def test_tracer_detaches_from_controlling_terminal(monkeypatch):
+    """The tracer child must be setid()'d so a (sudo) child can never read
+    /dev/tty or restore termios over the TUI's raw mode — the regression
+    where `--mmap-pid`/Enter-on-process silently killed all keyboard input."""
+    w = _watcher(binary="/fake")
+    fake_proc = mock.MagicMock()
+    fake_proc.stdout = io.BytesIO(b"")
+    fake_proc.stdin = io.StringIO()
+    with mock.patch("dimergio.mmap.subprocess.Popen", return_value=fake_proc) as popen:
+        assert w.enable(101, lambda *a: None)
+    kwargs = popen.call_args.kwargs
+    assert kwargs.get("start_new_session") is True
+
+
+def test_tracer_sudo_refuses_when_password_required(monkeypatch):
+    """If the tracer would run under an interactive sudo (password prompt on
+    /dev/tty), refuse to start it instead of corrupting the TUI's terminal."""
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    run = mock.MagicMock(return_value=SimpleNamespace(returncode=1))
+    monkeypatch.setattr(mm.subprocess, "run", run)
+    popen = mock.MagicMock()
+    monkeypatch.setattr(mm.subprocess, "Popen", popen)
+    w = MmapWatcher(path_ok=lambda p: True, binary="/fake", use_sudo=True)
+    assert w.enable(101, lambda *a: None) is False
+    run.assert_called_once_with(["sudo", "-n", "true"])
+    popen.assert_not_called()
+
+
+def test_tracer_sudo_runs_passwordless_and_detached(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(mm.subprocess, "run", mock.MagicMock(return_value=SimpleNamespace(returncode=0)))
+    fake_proc = mock.MagicMock()
+    fake_proc.stdout = io.BytesIO(b"")
+    fake_proc.stdin = io.StringIO()
+    popen = mock.MagicMock(return_value=fake_proc)
+    monkeypatch.setattr(mm.subprocess, "Popen", popen)
+    w = MmapWatcher(path_ok=lambda p: True, binary="/fake", use_sudo=True)
+    assert w.enable(101, lambda *a: None) is True
+    assert popen.call_args.args[0] == ["sudo", "/fake", "--interval-ms", "10"]
+    assert popen.call_args.kwargs.get("start_new_session") is True
+
+
 # ─── CLI: bare `dimergio` must still expose watch defaults ─────────
 def test_parser_no_args_exposes_mmap_pid():
     """`dimergio` with no subcommand runs cmd_watch, so every watch default

@@ -179,6 +179,22 @@ class MmapWatcher:
         assert self._binary is not None
         cmd = [self._binary, "--interval-ms", str(self._interval_ms)]
         if self._use_sudo and os.geteuid() != 0:
+            # The tracer runs under sudo while the TUI's key reader owns the
+            # terminal. An interactive sudo would prompt on /dev/tty and, on
+            # exit, restore termios over the TUI's raw mode — silently killing
+            # all keyboard input. Refuse to run it unless sudo is passwordless,
+            # and detach the child from the controlling terminal entirely so it
+            # can never touch the user's tty.
+            if subprocess.run(["sudo", "-n", "true"]).returncode != 0:
+                import getpass
+                logger.warning(
+                    "mmap tracer needs passwordless sudo — run:\n"
+                    "  echo '%s ALL=(root) NOPASSWD: %s' | "
+                    "sudo tee /etc/sudoers.d/dimergio-mmap && sudo chmod 0440 /etc/sudoers.d/dimergio-mmap",
+                    getpass.getuser(),
+                    self._binary,
+                )
+                return False
             cmd = ["sudo"] + cmd
         try:
             proc = subprocess.Popen(
@@ -186,6 +202,7 @@ class MmapWatcher:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
         except OSError as exc:
             logger.warning("mmap tracer failed to start: %s", exc)

@@ -45,6 +45,67 @@ def _cycle_sort_key(current: str, direction: int, keys: tuple[str, ...]) -> str:
     return keys[(idx + direction) % len(keys)]
 
 
+_CSI_U_KEYS = {
+    "1": "\x1b[H",   # Home
+    "4": "\x1b[F",   # End
+    "5": "\x1b[5~",  # PageUp
+    "6": "\x1b[6~",  # PageDown
+    "9": "\t",       # Tab
+    "13": "\n",      # Enter
+    "27": "\x1b",    # Esc
+    "32": " ",       # Space
+}
+
+
+def _csiu_to_key(code: str) -> str:
+    """Map a kitty CSI-u key code (e.g. ``27`` from ``\x1b[27;5u``) to the
+    canonical readchar key. Unknown codes pass through as ``\x1b[<code>u``."""
+    base = code.split(";", 1)[0]
+    return _CSI_U_KEYS.get(base, "\x1b[" + base + "u")
+
+
+def _normalize_key(seq: str) -> str:
+    """Normalize any terminal's escape-sequence dialect to the canonical
+    readchar key constants the handlers compare against.
+
+    Covers the common modes dimergio can be launched under: plain CSI arrows
+    (``\x1b[A``), application-cursor mode (SS3 ``\x1bOA``), xterm alternate
+    Home/End (``\x1b[1~``/``\x1b[4~``), modified arrows (``\x1b[1;5A``), and
+    the kitty keyboard protocol (CSI-u, e.g. ``\x1b[1;1A`` / ``\x1b[27u``).
+    Modifiers are stripped so Shift/Ctrl+arrow still navigates/sorts.
+    """
+    if len(seq) < 3 or not seq.startswith("\x1b"):
+        return seq
+    if seq.startswith("\x1bO"):
+        # SS3/application-cursor mode: ESC O <letter> → ESC [ <letter>.
+        return "\x1b[" + seq[2:]
+    if not seq.startswith("\x1b["):
+        return seq
+    body = seq[2:]
+    if body.endswith("u"):
+        # Kitty CSI-u: ESC [ <code> [; <modifier>] u.
+        return _csiu_to_key(body[:-1])
+    final = body[-1]
+    if final in "ABCDHF":
+        # Arrows / Home / End, possibly with a parameter prefix (kitty
+        # ``\x1b[1;1A``, xterm ``\x1b[1;5A``, DEC ``\x1b[1A``) — the plain
+        # key is enough for navigation/sort.
+        return "\x1b[" + final
+    if final == "~":
+        # ESC [ <num> [; <mod>] ~  (PageUp/Down, alternate Home/End).
+        nums = [p for p in body[:-1].split(";") if p.isdigit()]
+        num = nums[0] if nums else ""
+        if num in ("1", "7"):
+            return "\x1b[H"
+        if num in ("4", "8"):
+            return "\x1b[F"
+        if num in ("5",):
+            return "\x1b[5~"
+        if num in ("6",):
+            return "\x1b[6~"
+    return seq
+
+
 class _Keys:
     """Single source of truth for every interactive keybinding.
 
@@ -60,6 +121,7 @@ class _Keys:
         self.ENTER = k.ENTER
         self.ESC = k.ESC
         self.SPACE = k.SPACE
+        self.TAB = k.TAB
         self.SORT_LEFT = k.LEFT
         self.SORT_RIGHT = k.RIGHT
         self.CLEAR_MARK = "-"
@@ -70,8 +132,10 @@ class _Keys:
         self.NAND = "M"
         self.MMAP = "m"
 
-        # HOME/END switch focus between the file list and the process list
-        # (they no longer scroll within a list — PageUp/PageDown do that).
+        # TAB switches focus between the file list and the process list
+        # (Home/End kept as aliases). Arrow keys navigate within a list and
+        # Left/Right re-sort whichever panel is focused.
+        self.FOCUS_TOGGLE = k.TAB
         self.FOCUS_PROCS = k.HOME
         self.FOCUS_FILES = k.END
 
@@ -83,21 +147,16 @@ class _Keys:
             k.PAGE_DOWN: "page_down",
         }
 
-        # Shifted number row → branch index (mark all rows up to cursor).
-        self.SHIFT_DIGIT = {
-            ")": 0, "!": 1, "@": 2, "#": 3, "$": 4,
-            "%": 5, "^": 6, "&": 7, "*": 8, "(": 9,
-        }
-
         # Sort columns cycled with Left/Right; order defines rotation.
         self.SORT = ("iowait_per_mb", "iowait", "reads")
+        self.PROC_SORT = ("mmap", "reads", "iowait")
 
         # Help hints rendered as panel subtitles. Kept next to the bindings so
         # a change to a key forces a change to its documentation.
         self.BROWSE_HINT = (
-            "↑↓:scroll  ←/→:sort  Space:rotate  Enter:review  0-9:mark  "
-            "Shift+0-9:mark above  -:clear  c:clear stats  s:show-exited  "
-            "Home:procs End:files m:mmap []:sample  M:nand  q:quit"
+            "↑↓:scroll  ←/→:sort  Tab:files/procs  Space:mark  "
+            "Enter:review  -:clear  c:clear stats  s:show-exited  "
+            "m:mmap []:sample  M:nand  q:quit"
         )
         self.PREVIEW_HINT = "Enter: execute  Esc: back  q: quit"
 
@@ -631,7 +690,8 @@ class Collector:
         self.start_fatrace(sampler)
 
         for pid in self.mmap_pids:
-            self._mmap_watcher.enable(pid, self._on_mmap)
+            if not self._mmap_watcher.enable(pid, self._on_mmap):
+                logger.warning("mmap tracing for pid %d could not start (see earlier warning)", pid)
 
         use_interactive = (
             not self.pid
@@ -714,11 +774,14 @@ class Collector:
         quit_confirm_at: float | None = None
         clear_stats_at: float | None = None
         show_exited: bool = False
-        # Focus ("files" | "procs") + process-list cursor. HOME switches to the
-        # process list, END back to the file list; Home/End no longer scroll.
+        # Focus ("files" | "procs") + process-list cursor. TAB switches focus;
+        # Home/End are aliases. Arrow keys navigate the focused list and
+        # Left/Right re-sort whichever panel is focused.
         focus = "files"
         proc_scroll = 0
         proc_selected = 0
+        # Sort column for the process panel (cycled by Left/Right when focused).
+        proc_sort = KEYS.PROC_SORT[0]
         # Transient status message (e.g. mmap tracer missing), shown briefly.
         flash_msg = ""
         flash_at: float | None = None
@@ -864,6 +927,8 @@ class Collector:
         # ─── BROWSE layout (merged monitor + select) ─────────────────
         def _build_browse(now: float) -> Panel:
             nonlocal focus, proc_scroll, proc_selected, flash_msg, flash_at
+            _SORT_LABEL = {"reads": "READS", "iowait": "IOWAIT", "iowait_per_mb": "IOW/MB"}
+            _PROC_SORT_LABEL = {"mmap": "MMAP", "reads": "READS", "iowait": "IOWAIT"}
             elapsed = _fmt_duration(now - start_time)
             n_reads = self._pid_stats_total_reads()
             n_files = len(self._accumulators)
@@ -928,10 +993,14 @@ class Collector:
             proc_table: Table | None = None
             if self.is_monitoring:
                 proc_table = Table(show_header=True, header_style="bold", box=_SIMPLE_BOX, expand=True, pad_edge=False)
-                proc_table.add_column("PROCESS", width=18, no_wrap=True)
-                proc_table.add_column("READS", justify="right", width=10, no_wrap=True)
-                proc_table.add_column("MMAP", justify="right", width=10, no_wrap=True)
-                proc_table.add_column("IOWAIT(s)", justify="right", width=10, no_wrap=True)
+                proc_focus = "▸" if focus == "procs" else " "
+                proc_table.add_column(f"{proc_focus}PROCESS", width=18, no_wrap=True)
+                for col_key in ("reads", "mmap", "iowait"):
+                    col_name = _PROC_SORT_LABEL[col_key]
+                    proc_table.add_column(
+                        f"*{col_name}" if proc_sort == col_key else f" {col_name}",
+                        justify="right", width=10, no_wrap=True,
+                    )
                 proc_table.add_column("STATUS", width=7, no_wrap=True)
                 rows = _proc_visible_rows()
                 if proc_selected >= len(rows):
@@ -963,9 +1032,9 @@ class Collector:
             sorted_f = _sorted_files()
             max_vis, scroll_end, visible_files = _visible_file_slice(sorted_f)
 
-            _SORT_LABEL = {"reads": "READS", "iowait": "IOWAIT", "iowait_per_mb": "IOW/MB"}
             file_table = Table(show_header=True, header_style="", box=_SIMPLE_BOX, expand=True, pad_edge=False)
-            file_table.add_column("#", justify="right", width=4, no_wrap=True)
+            file_focus = "▸" if focus == "files" else " "
+            file_table.add_column(f"{file_focus}#", justify="right", width=4, no_wrap=True)
             for col_key in ("reads", "iowait", "iowait_per_mb"):
                 col_name = _SORT_LABEL[col_key]
                 file_table.add_column(
@@ -1040,7 +1109,10 @@ class Collector:
 
             sub = KEYS.BROWSE_HINT
 
-            sort_line = Text.from_markup(f"[bold]Sort:[/bold] [reverse]{_SORT_LABEL[sort_key]}[/reverse] ▼")
+            sort_line = Text.from_markup(
+                f"[bold]Sort:[/bold] [reverse]{_SORT_LABEL[sort_key] if focus == 'files' else _PROC_SORT_LABEL[proc_sort]}[/reverse] ▼   "
+                f"[dim]Focus:[/dim] [reverse]{'procs' if focus == 'procs' else 'files'}[/reverse]"
+            )
             body: list = [header, sort_line, tiers_line]
             if proc_table is not None:
                 body.append(proc_table)
@@ -1098,10 +1170,6 @@ class Collector:
         # on the KEYS object (see _Keys), so handlers and the on-screen legend
         # can never drift apart.
 
-        def _rotate_sort(direction: int) -> None:
-            nonlocal sort_key
-            sort_key = _cycle_sort_key(sort_key, direction, KEYS.SORT)
-
         def _nav_file(key: str) -> bool:
             """Scroll the file list. Single navigation path for all modes."""
             nonlocal file_scroll, file_selected
@@ -1116,10 +1184,8 @@ class Collector:
         def _proc_rows() -> list[tuple[int, str, int, int, str]]:
             """Ordered process rows: (pid, name, reads, mmap_bytes, status).
 
-            Candidates from the last 'm' mmap scan are pinned on top (sorted by
-            total ``read_bytes`` descending — a monotonic counter, so ordering is
-            stable between scans), followed by the remaining known PIDs by
-            fatrace read count.
+            Rows are sorted by the currently focused process column (``proc_sort``):
+            mmap bytes, fatrace read count, or total iowait.
             """
             rows: list[tuple[int, str, int, int, str]] = []
             seen: set[int] = set()
@@ -1129,11 +1195,20 @@ class Collector:
                 reads = stat.read_count if stat else 0
                 status = "watch" if self._mmap_watcher.is_watching(c.pid) else "cand"
                 rows.append((c.pid, c.process_name, reads, c.read_bytes, status))
-            for s in sorted(self._pid_stats.values(), key=lambda s: s.read_count, reverse=True):
+            for s in self._pid_stats.values():
                 if s.pid in seen:
                     continue
                 status = "run" if not s.exited else "exited"
                 rows.append((s.pid, s.process_name, s.read_count, 0, status))
+            if proc_sort == "mmap":
+                rows.sort(key=lambda r: r[3], reverse=True)
+            elif proc_sort == "reads":
+                rows.sort(key=lambda r: r[2], reverse=True)
+            elif proc_sort == "iowait":
+                def _io_key(r):
+                    s = self._pid_stats.get(r[0])
+                    return s.total_iowait_sec if s else 0.0
+                rows.sort(key=_io_key, reverse=True)
             return rows
 
         def _proc_visible_rows() -> list[tuple[int, str, int, int, str]]:
@@ -1176,14 +1251,34 @@ class Collector:
 
         def _handle_browse_key(key: str) -> bool:
             nonlocal file_scroll, file_selected, clear_stats_at, nand_warn, pending_plans
-            nonlocal show_exited, sort_key, in_preview, focus, proc_scroll, proc_selected
+            nonlocal show_exited, sort_key, proc_sort, in_preview, focus, proc_scroll, proc_selected
 
-            # Focus switching — Home/End no longer scroll lists.
-            if key == KEYS.FOCUS_PROCS:
+            # Focus switching — TAB toggles between the file and process lists
+            # (Home/End kept as aliases). Offline review has no process table,
+            # so refuse to focus it there.
+            def _focus_procs() -> bool:
+                if not self.is_monitoring:
+                    _set_flash("process list only while watching — offline review has no live processes")
+                    return False
+                nonlocal focus, proc_scroll, proc_selected
                 focus = "procs"
+                proc_scroll = 0
+                proc_selected = 0
+                return True
+
+            def _focus_files() -> bool:
+                nonlocal focus
+                focus = "files"
+                return True
+
+            if key == KEYS.FOCUS_TOGGLE or key == KEYS.FOCUS_PROCS:
+                if focus == "files":
+                    _focus_procs()
+                else:
+                    _focus_files()
                 return False
             if key == KEYS.FOCUS_FILES:
-                focus = "files"
+                _focus_files()
                 return False
 
             # Keys that act globally regardless of focus.
@@ -1206,23 +1301,40 @@ class Collector:
                     _set_flash("mmap tracer not available — build src/dimergio/bpf (make)")
                     return False
                 self._mmap_watcher.scan()
-                focus = "procs"
-                proc_scroll = 0
-                proc_selected = 0
+                _focus_procs()
+                return False
+
+            # Left/Right re-sort the focused panel.
+            if key == KEYS.SORT_LEFT:
+                if focus == "procs":
+                    proc_sort = _cycle_sort_key(proc_sort, 1, KEYS.PROC_SORT)
+                else:
+                    sort_key = _cycle_sort_key(sort_key, 1, KEYS.SORT)
+                return False
+            if key == KEYS.SORT_RIGHT:
+                if focus == "procs":
+                    proc_sort = _cycle_sort_key(proc_sort, -1, KEYS.PROC_SORT)
+                else:
+                    sort_key = _cycle_sort_key(sort_key, -1, KEYS.SORT)
                 return False
 
             if focus == "procs":
-                if _nav_proc(key):
+                # Empty process list: fall through to the file list so arrows
+                # never feel dead (and flip focus back to files).
+                if not _proc_visible_rows():
+                    focus = "files"
+                else:
+                    if _nav_proc(key):
+                        return False
+                    if key == KEYS.ENTER:
+                        rows = _proc_visible_rows()
+                        if rows and proc_selected < len(rows):
+                            pid = rows[proc_selected][0]
+                            if self._mmap_watcher.is_watching(pid):
+                                self._mmap_watcher.disable(pid)
+                            elif not self._mmap_watcher.enable(pid, self._on_mmap):
+                                _set_flash("cannot start mmap tracer — run as root or build dimergio-mmap")
                     return False
-                if key == KEYS.ENTER:
-                    rows = _proc_visible_rows()
-                    if rows and proc_selected < len(rows):
-                        pid = rows[proc_selected][0]
-                        if self._mmap_watcher.is_watching(pid):
-                            self._mmap_watcher.disable(pid)
-                        elif not self._mmap_watcher.enable(pid, self._on_mmap):
-                            _set_flash("cannot start mmap tracer — run as root or build dimergio-mmap")
-                return False
 
             # ── file focus ────────────────────────────────────────────
             sorted_f = _sorted_files()
@@ -1237,12 +1349,6 @@ class Collector:
                 return False
             if _nav_file(key):
                 return False
-            if key == KEYS.SORT_LEFT:
-                _rotate_sort(1)
-                return False
-            if key == KEYS.SORT_RIGHT:
-                _rotate_sort(-1)
-                return False
             if key == KEYS.SPACE:
                 if file_selected < len(sorted_f):
                     acc = sorted_f[file_selected]
@@ -1252,21 +1358,6 @@ class Collector:
                         file_marks.pop(acc.path, None)
                     else:
                         file_marks[acc.path] = nxt
-            elif key in KEYS.SHIFT_DIGIT:
-                br_idx = KEYS.SHIFT_DIGIT[key]
-                if br_idx < len(branches) and file_selected < len(sorted_f):
-                    for i in range(file_selected + 1):
-                        acc = sorted_f[i]
-                        if acc.write_count == 0:
-                            file_marks[acc.path] = br_idx
-            elif key.isdigit():
-                br_idx = int(key)
-                if br_idx < len(branches) and file_selected < len(sorted_f):
-                    acc = sorted_f[file_selected]
-                    if br_idx == acc.branch_idx:
-                        file_marks.pop(acc.path, None)
-                    else:
-                        file_marks[acc.path] = br_idx
             elif key == KEYS.CLEAR_MARK:
                 if file_selected < len(sorted_f):
                     file_marks.pop(sorted_f[file_selected].path, None)
@@ -1321,9 +1412,10 @@ class Collector:
         def _read_raw_key() -> str | None:
             """Read a single keystroke directly from the raw terminal.
 
-            Mirrors readchar.readkey() but uses sys.stdin.read(1) directly,
-            avoiding readchar's TCSAFLUSH which discards buffered input and
-            drops keystrokes.
+            Assembles escape sequences ourselves (mirroring readchar.readkey()
+            but avoiding its TCSAFLUSH which drops buffered keystrokes) and
+            normalizes every dialect — CSI, SS3/application-mode, xterm
+            alternate, and kitty CSI-u — to the canonical readchar constants.
             """
             try:
                 ch = sys.stdin.read(1)
@@ -1335,30 +1427,34 @@ class Collector:
             if ch != "\x1b":
                 return ch
 
-            # Escape sequence: consume the rest the same way readkey() does.
             try:
                 ch2 = sys.stdin.read(1)
             except (OSError, ValueError):
                 return ch
             if ch2 not in "\x4f\x5b":
                 return ch + ch2
-            try:
-                ch3 = sys.stdin.read(1)
-            except (OSError, ValueError):
-                return ch + ch2
-            if ch3 not in "\x31\x32\x33\x35\x36":
-                return ch + ch2 + ch3
-            try:
-                ch4 = sys.stdin.read(1)
-            except (OSError, ValueError):
-                return ch + ch2 + ch3
-            if ch4 not in "\x30\x31\x33\x34\x35\x37\x38\x39":
-                return ch + ch2 + ch3 + ch4
-            try:
-                ch5 = sys.stdin.read(1)
-            except (OSError, ValueError):
-                return ch + ch2 + ch3 + ch4
-            return ch + ch2 + ch3 + ch4 + ch5
+
+            seq = ch + ch2
+            if ch2 == "\x4f":
+                # SS3/application-cursor mode: ESC O <final>.
+                try:
+                    seq += sys.stdin.read(1)
+                except (OSError, ValueError):
+                    pass
+                return _normalize_key(seq)
+
+            # CSI: consume parameters (digits/;) until the final byte.
+            while True:
+                try:
+                    c = sys.stdin.read(1)
+                except (OSError, ValueError):
+                    break
+                if not c:
+                    break
+                seq += c
+                if c not in "\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39;":
+                    break
+            return _normalize_key(seq)
 
         def _key_reader() -> None:
             while not _stop_reader.is_set():

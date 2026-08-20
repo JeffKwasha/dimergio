@@ -61,6 +61,83 @@ def test_readchar_enter_is_lf():
     assert key.ENTER == "\n"
 
 
+# ─── escape-sequence dialect normalization ───────────────────────────
+def test_normalize_key_canonical_forms_pass_through():
+    """The canonical CSI arrow/home/end sequences are unchanged, so every
+    dialect maps onto them and readchar's constants stay the source of truth."""
+    from dimergio.collector import _normalize_key
+
+    assert _normalize_key("\x1b[A") == "\x1b[A"
+    assert _normalize_key("\x1b[B") == "\x1b[B"
+    assert _normalize_key("\x1b[C") == "\x1b[C"
+    assert _normalize_key("\x1b[D") == "\x1b[D"
+    assert _normalize_key("\x1b[H") == "\x1b[H"
+    assert _normalize_key("\x1b[F") == "\x1b[F"
+
+
+def test_normalize_key_application_cursor_mode():
+    """Terminals running with application-cursor (DECCKM) send SS3 ``\x1bO*``;
+    these must decode to the same keys as plain CSI arrows."""
+    from dimergio.collector import _normalize_key
+
+    assert _normalize_key("\x1bOA") == "\x1b[A"
+    assert _normalize_key("\x1bOB") == "\x1b[B"
+    assert _normalize_key("\x1bOC") == "\x1b[C"
+    assert _normalize_key("\x1bOD") == "\x1b[D"
+    assert _normalize_key("\x1bOH") == "\x1b[H"
+    assert _normalize_key("\x1bOF") == "\x1b[F"
+
+
+def test_normalize_key_kitty_and_modified_arrows():
+    """The kitty keyboard protocol (and xterm modifier encodings) prefix
+    arrows with parameters; modifiers are stripped for navigation/sort."""
+    from dimergio.collector import _normalize_key
+
+    assert _normalize_key("\x1b[1;1A") == "\x1b[A"  # kitty plain up
+    assert _normalize_key("\x1b[1;2A") == "\x1b[A"  # kitty shift-up
+    assert _normalize_key("\x1b[1;5C") == "\x1b[C"  # kitty ctrl-right
+    assert _normalize_key("\x1b[1A") == "\x1b[A"    # DEC prefix form
+    assert _normalize_key("\x1b[1;5B") == "\x1b[B"  # xterm ctrl-down
+
+
+def test_normalize_key_alternate_home_end_page():
+    """xterm alternate (application-keypad) Home/End and the page keys decode
+    to the canonical sequences."""
+    from dimergio.collector import _normalize_key
+
+    assert _normalize_key("\x1b[1~") == "\x1b[H"
+    assert _normalize_key("\x1b[7~") == "\x1b[H"
+    assert _normalize_key("\x1b[4~") == "\x1b[F"
+    assert _normalize_key("\x1b[8~") == "\x1b[F"
+    assert _normalize_key("\x1b[5~") == "\x1b[5~"
+    assert _normalize_key("\x1b[6~") == "\x1b[6~"
+    assert _normalize_key("\x1b[5;2~") == "\x1b[5~"
+
+
+def test_normalize_key_csi_u_codes():
+    """The kitty CSI-u protocol encodes plain keys as ``\x1b[<code>u``."""
+    from dimergio.collector import _normalize_key
+
+    assert _normalize_key("\x1b[27u") == "\x1b"
+    assert _normalize_key("\x1b[13u") == "\n"
+    assert _normalize_key("\x1b[9u") == "\t"
+    assert _normalize_key("\x1b[32u") == " "
+    assert _normalize_key("\x1b[1u") == "\x1b[H"
+    assert _normalize_key("\x1b[4u") == "\x1b[F"
+    assert _normalize_key("\x1b[27;5u") == "\x1b"
+
+
+def test_normalize_key_ordinary_keys_unchanged():
+    """Letters, Tab, Enter and lone Esc must pass through untouched."""
+    from dimergio.collector import _normalize_key
+
+    assert _normalize_key("q") == "q"
+    assert _normalize_key("\t") == "\t"
+    assert _normalize_key("\n") == "\n"
+    assert _normalize_key("\x1b") == "\x1b"
+    assert _normalize_key(" ") == " "
+
+
 # ─── _apply_nav: the shared navigation source of truth ──────────────
 def test_nav_up_down_clamped():
     assert _apply_nav(0, 0, 10, 5, "down") == (0, 1)
@@ -117,7 +194,8 @@ def test_keys_is_single_source_of_truth():
     keys = _Keys()
     assert keys.SORT[0] == "iowait_per_mb"
     assert keys.ENTER and keys.ESC and keys.SPACE
-    assert len(keys.SHIFT_DIGIT) == 10
+    assert keys.TAB == "\t"
+    assert keys.PROC_SORT == ("mmap", "reads", "iowait")
 
     src = inspect.getsource(Collector._run_interactive)
     # The old scattered lookup tables must be gone.
@@ -126,11 +204,54 @@ def test_keys_is_single_source_of_truth():
     assert "_NAV_KIND" not in src
     # Handlers dispatch through the shared bindings object.
     assert "KEYS.ENTER" in src
-    assert "KEYS.SHIFT_DIGIT" in src
     assert "KEYS.NAV" in src
+    assert "KEYS.FOCUS_TOGGLE" in src
+    assert "KEYS.PROC_SORT" in src
     # Legend hints are sourced from _Keys, not inline strings.
     assert "KEYS.BROWSE_HINT" in src
     assert "KEYS.PREVIEW_HINT" in src
+
+
+def test_no_digit_mark_keys():
+    """0-9 / Shift+0-9 mark shortcuts are removed — SPACE on the selected row
+    is the only way to cycle a file's target branch."""
+    import inspect
+
+    from dimergio.collector import Collector, _Keys
+
+    assert not hasattr(_Keys(), "SHIFT_DIGIT")
+    src = inspect.getsource(Collector._run_interactive)
+    assert "SHIFT_DIGIT" not in src
+    assert "key.isdigit()" not in src
+    # SPACE (mark the selected file) remains the marking gesture.
+    assert "KEYS.SPACE" in src
+
+
+def test_tab_toggles_focus_and_left_right_sort_focused_panel():
+    """TAB switches files↔procs; Left/Right re-sort the *focused* panel, so
+    the procs panel gets its own sort cycle while files keep theirs."""
+    import inspect
+
+    from dimergio.collector import Collector
+
+    src = inspect.getsource(Collector._run_interactive)
+    assert "KEYS.FOCUS_TOGGLE" in src
+    # Sort handlers act on the focused panel (proc_sort vs sort_key).
+    assert "proc_sort = _cycle_sort_key" in src
+    assert "KEYS.PROC_SORT" in src
+
+
+def test_empty_procs_list_falls_through_to_files():
+    """Focus on an empty process list must not swallow arrows — it falls back
+    to the file list so navigation/sort never feel dead."""
+    import inspect
+
+    from dimergio.collector import Collector
+
+    src = inspect.getsource(Collector._run_interactive)
+    assert "if not _proc_visible_rows():" in src
+    assert 'focus = "files"' in src
+    assert 'focus == "procs"' in src
 
 
 # ─── fatrace lifecycle owns proc + reader thread together ───────────
