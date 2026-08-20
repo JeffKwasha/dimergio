@@ -58,6 +58,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
     cfg = load_config()
     iowait_ms = args.iowait_interval or cfg.get("iowait_interval_ms", 10)
+    symlink_depth = cfg.get("symlink_depth", 3)
 
     debug_log = args.debug_log
     if debug_log is True:
@@ -91,6 +92,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             data_path=data_path,
             no_interactive=args.no_interactive,
             preloaded=accumulators,
+            symlink_depth=symlink_depth,
             debug_log=debug_log,
         )
         collector.run()
@@ -108,6 +110,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             pid=args.pid,
             use_sudo=args.sudo,
             iowait_interval_ms=iowait_ms,
+            symlink_depth=symlink_depth,
             no_interactive=args.no_interactive,
             verbose=args.verbose,
             debug_log=debug_log,

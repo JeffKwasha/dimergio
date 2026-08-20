@@ -14,6 +14,9 @@ DEFAULTS = dict(
     default_pool="/mnt/games",
     checkpoint_interval_s=60,
     iowait_interval_ms=10,
+    # Depth (from the data path / pwd) to walk for symlinks when building the
+    # display-name map. 0 disables symlink-name resolution entirely.
+    symlink_depth=3,
 )
 
 

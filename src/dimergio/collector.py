@@ -311,6 +311,7 @@ class Collector:
         preloaded: dict[Path, FileAccumulator] | None = None,
         debug_log: Path | None = None,
         mmap_pids: list[int] | None = None,
+        symlink_depth: int = 3,
     ):
         self.pool = pool
         self.data_path = data_path or pool.mount
@@ -322,7 +323,7 @@ class Collector:
         self._pid_stats: dict[int, PidStat] = {}
         self._my_uid = os.getuid()
         self._stop_flag = threading.Event()
-        self._branch_for_path: dict[Path, int] = {}
+        self._branch_for_path: dict[Path, int | None] = {}
         self._no_interactive = no_interactive
         self._volume_mounts: list[tuple[Path, Path, int]] = []
         self._written_paths: set[Path] = set()
@@ -335,6 +336,11 @@ class Collector:
         self._fatrace_thread: threading.Thread | None = None
         self.mmap_pids = mmap_pids or []
         self._sampler: IOWaitSampler | None = None
+        self.symlink_depth = symlink_depth
+        # Canonicalized-path cache (per session; paths do not change location
+        # while we run) and the one-time symlink reverse map (shortest wins).
+        self._resolved_paths: dict[Path, Path | None] = {}
+        self._symlink_map: dict[Path, str] = self._build_symlink_map()
         from .mmap import MmapWatcher
 
         self._mmap_watcher = MmapWatcher(
@@ -385,6 +391,101 @@ class Collector:
                     break
             if vol_root is not None and branch_subvol:
                 self._volume_mounts.append((vol_root, Path(branch_subvol), idx))
+
+    def _build_symlink_map(self) -> dict[Path, str]:
+        """One-time reverse map: real file → shortest symlink relpath (from pwd).
+
+        Walks ``data_path`` (the pwd anchor) up to ``symlink_depth`` levels and
+        indexes every symlink by its resolved target. On collision the shorter
+        relpath wins (longer ones are forgotten). Used only for display; the
+        real path is always kept for moves. Depth 0 disables the map.
+        """
+        result: dict[Path, str] = {}
+        if self.symlink_depth <= 0 or not self.data_path.exists():
+            return result
+
+        def shorter(a: str, b: str) -> bool:
+            return (a.count("/"), a) < (b.count("/"), b)
+
+        stack: list[tuple[Path, int]] = [(self.data_path, 0)]
+        while stack:
+            d, level = stack.pop()
+            if level >= self.symlink_depth:
+                continue
+            try:
+                it = os.scandir(d)
+            except OSError:
+                continue
+            with it:
+                for e in it:
+                    try:
+                        if e.is_symlink():
+                            target = self._canonicalize(Path(os.path.realpath(e.path)))
+                            if target is None or target.is_dir():
+                                continue
+                            rel = Path(e.path).relative_to(self.data_path)
+                            rel_s = str(rel)
+                            cur = result.get(target)
+                            if cur is None or shorter(rel_s, cur):
+                                result[target] = rel_s
+                        elif e.is_dir():
+                            stack.append((Path(e.path), level + 1))
+                    except OSError:
+                        continue
+        return result
+
+    def _canonicalize(self, path: Path) -> Path | None:
+        """Resolve a path to the real file's canonical pool-relative location.
+
+        Symlinks are fully resolved; paths that end up on a branch mount are
+        remapped back into ``data_path``. Returns None for paths that escape
+        the pool entirely. Cached per input path.
+        """
+        if path in self._resolved_paths:
+            return self._resolved_paths[path]
+        try:
+            real = path.resolve()
+        except OSError:
+            real = path
+        if self._in_data_path(real):
+            result: Path | None = real
+        else:
+            result = None
+            for branch in self.pool.branches:
+                try:
+                    rel = real.relative_to(branch.path)
+                except ValueError:
+                    continue
+                result = self.data_path / rel
+                break
+        self._resolved_paths[path] = result
+        return result
+
+    def _in_pool(self, path: Path) -> bool:
+        if self._in_data_path(path):
+            return True
+        for branch in self.pool.branches:
+            try:
+                path.relative_to(branch.path)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def _pool_rel(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self.data_path))
+        except ValueError:
+            return path.name
+
+    def _display_name_for(self, path: Path) -> str:
+        """Symlink path for ``path`` when one is indexed, else the rel path."""
+        target = self._canonicalize(path)
+        if target is not None:
+            link = self._symlink_map.get(target)
+            if link is not None:
+                return link
+        return self._pool_rel(path)
 
     def _ensure_pid_stat(self, pid: int, process_name: str, ts: float) -> PidStat:
         try:
@@ -637,6 +738,10 @@ class Collector:
             except ValueError:
                 return path.name
 
+        def _display_label(acc) -> str:
+            """Symlink name when one is indexed, else the pool-relative path."""
+            return acc.display_name or self._display_name_for(acc.path)
+
         def _branch_color(sc: str) -> str:
             return {"hdd": "blue", "ssd": "teal", "nvme": "green"}.get(sc, "red")
 
@@ -869,10 +974,11 @@ class Collector:
                 )
             file_table.add_column("FROM", width=8, no_wrap=True)
             file_table.add_column("TO", width=8, no_wrap=True)
+            file_table.add_column("SIZE", justify="right", width=10, no_wrap=True)
             file_table.add_column("FILE", no_wrap=True, ratio=1)
 
             if not sorted_f:
-                file_table.add_row("", "", "", "", "", "", "No files tracked yet.", style="dim")
+                file_table.add_row("", "", "", "", "", "", "", "No files tracked yet.", style="dim")
             else:
                 for rank, acc in enumerate(visible_files, file_scroll + 1):
                     br = branches[acc.branch_idx] if acc.branch_idx < len(branches) else branches[0]
@@ -894,7 +1000,8 @@ class Collector:
                         f"{_iowait_per_mb(acc):.4f}",
                         f"[{from_c}]{from_label}[/{from_c}]",
                         to_cell,
-                        _rel_path(acc.path),
+                        _fmt_bytes(_file_size(acc)),
+                        _display_label(acc),
                         style=row_style,
                     )
 
@@ -967,7 +1074,7 @@ class Collector:
                     str(i),
                     f"[{sc}]{src.short_label}[/{sc}]",
                     f"[{tc}]{tgt.short_label}[/{tc}]",
-                    _rel_path(acc.path),
+                    _display_label(acc),
                     _fmt_bytes(sz),
                 )
 
@@ -1320,15 +1427,19 @@ class Collector:
         return None
 
     def _resolve_tracked_path(self, path: Path) -> Path | None:
-        """Map any observed path to a pool-relative path under data_path.
+        """Map any observed path to the canonical pool-relative file path.
 
-        Accepts pool paths directly and remaps raw btrfs volume paths (what
-        fatrace and /proc/<pid>/maps report) to their pool-relative form.
-        Returns None when the path is not under the watched data path.
+        Symlink and raw btrfs volume paths are normalized to the real file's
+        location under data_path, so moves always target the actual file (never
+        a symlink). Returns None when the path is not under the watched data
+        path.
         """
         if self._in_data_path(path):
-            return path
-        return self._remap_volume_path(path)
+            return self._canonicalize(path)
+        pool_path = self._remap_volume_path(path)
+        if pool_path is None:
+            return None
+        return self._canonicalize(pool_path)
 
     def _parse_line(self, line: str) -> ReadEvent | None:
         m = _LINE_RE.match(line)
@@ -1366,17 +1477,23 @@ class Collector:
             s.process_name = proc
             # Track write count for this file
             branch_idx = self._resolve_branch(file_path)
-            try:
-                acc = self._accumulators[file_path]
-            except KeyError:
-                acc = FileAccumulator(
-                    path=file_path,
-                    branch_idx=branch_idx,
-                    first_seen=ts,
-                )
-                self._accumulators[file_path] = acc
-            acc.write_count += 1
-            acc.last_seen = ts
+            if branch_idx is None:
+                # File not on any branch (symlink/ghost path) — nothing to
+                # record for a relocatable file; write tracking already done.
+                pass
+            else:
+                try:
+                    acc = self._accumulators[file_path]
+                except KeyError:
+                    acc = FileAccumulator(
+                        path=file_path,
+                        branch_idx=branch_idx,
+                        first_seen=ts,
+                        display_name=self._display_name_for(file_path),
+                    )
+                    self._accumulators[file_path] = acc
+                acc.write_count += 1
+                acc.last_seen = ts
 
         if event_type[0] != "R":
             return None
@@ -1386,6 +1503,13 @@ class Collector:
         proc = m.group("proc")
 
         branch_idx = self._resolve_branch(file_path)
+        if branch_idx is None:
+            # Path only exists through a symlink/mergerfs artifact — it has no
+            # real location on any branch, so it cannot be relocated. Drop it
+            # rather than attributing the read to a guessed branch.
+            if self._verbose:
+                logger.info("  parse: no branch holds %s — dropped", file_path)
+            return None
         return ReadEvent(
             file_path=file_path,
             pid=pid,
@@ -1411,6 +1535,7 @@ class Collector:
                 path=key,
                 branch_idx=event.branch_idx,
                 first_seen=event.timestamp,
+                display_name=self._display_name_for(key),
             )
             self._accumulators[key] = acc
         acc.observe(event.timestamp, iowait)
@@ -1432,6 +1557,10 @@ class Collector:
 
         ts = time.time()
         branch_idx = self._resolve_branch(norm)
+        if branch_idx is None:
+            if self._verbose:
+                logger.info("  mmap: no branch holds %s — dropped", norm)
+            return
 
         s = self._ensure_pid_stat(pid, _proc_comm(pid), ts)
         s.read_count += count
@@ -1442,7 +1571,12 @@ class Collector:
         try:
             acc = self._accumulators[norm]
         except KeyError:
-            acc = FileAccumulator(path=norm, branch_idx=branch_idx, first_seen=ts)
+            acc = FileAccumulator(
+                path=norm,
+                branch_idx=branch_idx,
+                first_seen=ts,
+                display_name=self._display_name_for(norm),
+            )
             self._accumulators[norm] = acc
         iowait = self._sampler.get_busy(branch_idx)
         acc.observe_n(ts, iowait, count)
@@ -1455,7 +1589,13 @@ class Collector:
         except ValueError:
             return False
 
-    def _resolve_branch(self, path: Path) -> int:
+    def _resolve_branch(self, path: Path) -> int | None:
+        """Branch index holding ``path``, or None when no branch has it.
+
+        Returns None (not a guess) when the file cannot be located on any
+        branch — e.g. paths recorded through symlink/mergerfs artifacts. Callers
+        drop such events rather than attributing them to a wrong branch.
+        """
         try:
             return self._branch_for_path[path]
         except KeyError:
@@ -1464,20 +1604,13 @@ class Collector:
         try:
             rel = path.relative_to(self.data_path)
         except ValueError:
-            self._branch_for_path[path] = 0
-            return 0
+            self._branch_for_path[path] = None
+            return None
 
         for idx, branch in enumerate(self.pool.branches):
-            candidate = branch.path / rel
-            if candidate.exists():
+            if (branch.path / rel).exists():
                 self._branch_for_path[path] = idx
                 return idx
 
-        for idx, branch in enumerate(self.pool.branches):
-            candidate = branch.path / rel
-            if candidate.exists():
-                self._branch_for_path[path] = idx
-                return idx
-
-        self._branch_for_path[path] = 0
-        return 0
+        self._branch_for_path[path] = None
+        return None

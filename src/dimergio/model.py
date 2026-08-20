@@ -77,6 +77,9 @@ class FileAccumulator:
     last_seen: float = 0.0
     iowait_debt: float = 0.0
     target_branch_idx: int | None = None  # marks intent for SELECT mode
+    # Human-readable label (a symlink path when one points at this file), used
+    # for display only — ``path`` always stays the real file location.
+    display_name: str = ""
 
     def observe(self, ts: float, iowait_sec: float) -> None:
         self.observe_n(ts, iowait_sec, 1)
