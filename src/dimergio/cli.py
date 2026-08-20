@@ -82,7 +82,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 return
         else:
             from .stats import load_accumulators
-            accumulators = load_accumulators(pool, data_path)
+            accumulators = load_accumulators(pool)
             if not accumulators:
                 print("No saved stats found. Run a watch session first.")
                 return
@@ -127,7 +127,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
         if accumulators:
             from .stats import load_stats, merge_stats, save_stats
             existing = load_stats(pool)
-            merged = merge_stats(existing, accumulators, data_path)
+            merged = merge_stats(existing, accumulators, pool)
             save_stats(pool, merged)
 
 
@@ -243,12 +243,42 @@ def cmd_undo(args: argparse.Namespace) -> None:
 
 
 def _parse_log(log_path: Path, pool, data_path: Path) -> dict:
-    from .collector import _LINE_RE
+    from .collector import _LINE_RE, build_volume_mounts, remap_volume_path
     from .model import FileAccumulator
     import os as _os
 
     my_uid = _os.getuid()
+    volume_mounts = build_volume_mounts(pool)
     accumulators: dict[Path, FileAccumulator] = {}
+
+    def _canonical(path: Path) -> Path | None:
+        """Pool-space canonical location of ``path``, or None outside the pool."""
+        real = path.resolve()
+        try:
+            real.relative_to(pool.mount)
+            return real
+        except ValueError:
+            pass
+        for branch in pool.branches:
+            try:
+                rel = real.relative_to(branch.path)
+            except ValueError:
+                continue
+            return pool.mount / rel
+        return None
+
+    def _resolve_tracked(path: Path) -> Path | None:
+        """Map a raw log path to its tracked pool-space canonical path."""
+        if path.is_relative_to(data_path):
+            canon = _canonical(path)
+        else:
+            pool_path = remap_volume_path(path, volume_mounts, pool.mount)
+            if pool_path is None:
+                return None
+            canon = _canonical(pool_path)
+        if canon is None or not canon.is_relative_to(data_path):
+            return None
+        return canon
 
     with open(log_path) as f:
         for line in f:
@@ -264,19 +294,24 @@ def _parse_log(log_path: Path, pool, data_path: Path) -> dict:
                 continue
             path = Path(m.group("path"))
             try:
-                path.relative_to(data_path)
-            except ValueError:
+                file_path = _resolve_tracked(path)
+            except (OSError, ValueError):
+                continue
+            if file_path is None:
                 continue
 
             branch_idx = 0
-            rel = path.relative_to(data_path)
+            try:
+                rel = file_path.relative_to(pool.mount)
+            except ValueError:
+                continue
             for idx, branch in enumerate(pool.branches):
                 if (branch.path / rel).exists():
                     branch_idx = idx
                     break
 
             ts = float(m.group("ts"))
-            key = path
+            key = file_path
             if key in accumulators:
                 acc = accumulators[key]
             else:

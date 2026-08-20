@@ -45,6 +45,77 @@ def _cycle_sort_key(current: str, direction: int, keys: tuple[str, ...]) -> str:
     return keys[(idx + direction) % len(keys)]
 
 
+def build_volume_mounts(pool: Pool) -> list[tuple[Path, Path, int]]:
+    """Map raw btrfs volume mount paths → pool branches.
+
+    fatrace reports paths through the btrfs volume mount (e.g.
+    /mnt/dev/HGST_r1/@/games/…), but the pool/branch uses a subvolume mount
+    (e.g. /mnt/@/r1_games/…).  This parses /proc/mounts to correlate each
+    branch to its parent volume mount + subvol path. Returns
+    ``[(vol_root, subvol_rel, branch_idx), ...]``.
+    """
+    mounts: list[tuple[str, Path, str]] = []
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 4 or parts[2] != "btrfs":
+                    continue
+                opts = parts[3].split(",")
+                subvol = ""
+                for o in opts:
+                    if o.startswith("subvol="):
+                        subvol = o[7:]
+                        break
+                mounts.append((parts[0], Path(parts[1]), subvol))
+    except OSError:
+        return []
+
+    volume_mounts: list[tuple[Path, Path, int]] = []
+    for idx, branch in enumerate(pool.branches):
+        branch_dev = None
+        branch_subvol = None
+        for dev, mp, subvol in mounts:
+            if mp == branch.path:
+                branch_dev = dev
+                branch_subvol = subvol
+                break
+        if not branch_dev:
+            continue
+        vol_root = None
+        for dev, mp, subvol in mounts:
+            if dev == branch_dev and subvol in ("", "/"):
+                vol_root = mp
+                break
+        if vol_root is not None and branch_subvol:
+            volume_mounts.append((vol_root, Path(branch_subvol), idx))
+    return volume_mounts
+
+
+def remap_volume_path(
+    path: Path,
+    volume_mounts: list[tuple[Path, Path, int]],
+    pool_mount: Path,
+) -> Path | None:
+    """Convert a raw btrfs volume path to a pool-relative path.
+
+    fatrace reports /mnt/dev/HGST_r1/@/games/file — remap to
+    /mnt/games/file (pool-relative).
+    """
+    for vol_root, subvol_rel, _ in volume_mounts:
+        try:
+            rel = subvol_rel.relative_to(Path("/"))
+        except ValueError:
+            continue
+        prefix = vol_root / rel
+        try:
+            pool_rel = path.relative_to(prefix)
+        except ValueError:
+            continue
+        return pool_mount / pool_rel
+    return None
+
+
 _CSI_U_KEYS = {
     "1": "\x1b[H",   # Home
     "4": "\x1b[F",   # End
@@ -499,40 +570,7 @@ class Collector:
         subvolume mount (e.g. /mnt/@/r1_games/…).  We parse /proc/mounts
         to correlate each branch to its parent volume mount + subvol path.
         """
-        mounts: list[tuple[str, Path, str]] = []
-        try:
-            with open("/proc/mounts") as f:
-                for line in f:
-                    parts = line.split()
-                    if len(parts) < 4 or parts[2] != "btrfs":
-                        continue
-                    opts = parts[3].split(",")
-                    subvol = ""
-                    for o in opts:
-                        if o.startswith("subvol="):
-                            subvol = o[7:]
-                            break
-                    mounts.append((parts[0], Path(parts[1]), subvol))
-        except OSError:
-            return
-
-        for idx, branch in enumerate(self.pool.branches):
-            branch_dev = None
-            branch_subvol = None
-            for dev, mp, subvol in mounts:
-                if mp == branch.path:
-                    branch_dev = dev
-                    branch_subvol = subvol
-                    break
-            if not branch_dev:
-                continue
-            vol_root = None
-            for dev, mp, subvol in mounts:
-                if dev == branch_dev and subvol in ("", "/"):
-                    vol_root = mp
-                    break
-            if vol_root is not None and branch_subvol:
-                self._volume_mounts.append((vol_root, Path(branch_subvol), idx))
+        self._volume_mounts = build_volume_mounts(self.pool)
 
     def _build_symlink_map(self) -> dict[Path, str]:
         """One-time reverse map: real file → shortest symlink relpath (from pwd).
@@ -579,9 +617,12 @@ class Collector:
     def _canonicalize(self, path: Path) -> Path | None:
         """Resolve a path to the real file's canonical pool-relative location.
 
-        Symlinks are fully resolved; paths that end up on a branch mount are
-        remapped back into ``data_path``. Returns None for paths that escape
-        the pool entirely. Cached per input path.
+        Symlinks are fully resolved. The canonical location is expressed in
+        pool space: a real path that resolves under ``pool.mount`` (or
+        ``data_path``) is kept as-is; a path that resolves onto a branch mount
+        is mapped back to its pool equivalent (``pool.mount / branch_rel``).
+        Returns None for paths that escape the pool entirely. Cached per input
+        path.
         """
         if path in self._resolved_paths:
             return self._resolved_paths[path]
@@ -589,7 +630,7 @@ class Collector:
             real = path.resolve()
         except OSError:
             real = path
-        if self._in_data_path(real):
+        if self._in_data_path(real) or self._under_pool_mount(real):
             result: Path | None = real
         else:
             result = None
@@ -598,25 +639,22 @@ class Collector:
                     rel = real.relative_to(branch.path)
                 except ValueError:
                     continue
-                result = self.data_path / rel
+                result = self.pool.mount / rel
                 break
         self._resolved_paths[path] = result
         return result
 
-    def _in_pool(self, path: Path) -> bool:
-        if self._in_data_path(path):
+    def _under_pool_mount(self, path: Path) -> bool:
+        try:
+            path.relative_to(self.pool.mount)
             return True
-        for branch in self.pool.branches:
-            try:
-                path.relative_to(branch.path)
-                return True
-            except ValueError:
-                continue
-        return False
+        except ValueError:
+            return False
 
     def _pool_rel(self, path: Path) -> str:
+        """Pool-relative string for ``path``, falling back to its name."""
         try:
-            return str(path.relative_to(self.data_path))
+            return str(path.relative_to(self.pool.mount))
         except ValueError:
             return path.name
 
@@ -880,7 +918,7 @@ class Collector:
 
         def _rel_path(path: Path) -> str:
             try:
-                return str(path.relative_to(self.data_path))
+                return str(path.relative_to(self.pool.mount))
             except ValueError:
                 return path.name
 
@@ -1599,35 +1637,34 @@ class Collector:
         """Convert a raw btrfs volume path to a pool-relative path.
 
         fatrace reports /mnt/dev/HGST_r1/@/games/file — remap to
-        /mnt/games/file  (under self.data_path).
+        /mnt/games/file  (pool-relative).
         """
-        for vol_root, subvol_rel, _ in self._volume_mounts:
-            try:
-                rel = subvol_rel.relative_to(Path("/"))
-            except ValueError:
-                continue
-            prefix = vol_root / rel
-            try:
-                pool_rel = path.relative_to(prefix)
-            except ValueError:
-                continue
-            return self.data_path / pool_rel
-        return None
+        return remap_volume_path(path, self._volume_mounts, self.pool.mount)
 
     def _resolve_tracked_path(self, path: Path) -> Path | None:
         """Map any observed path to the canonical pool-relative file path.
 
-        Symlink and raw btrfs volume paths are normalized to the real file's
-        location under data_path, so moves always target the actual file (never
-        a symlink). Returns None when the path is not under the watched data
-        path.
+        Symlink, raw btrfs volume, and plain pool paths are normalized to the
+        real file's pool-space location, so moves always target the actual file
+        (never a symlink). A file is tracked only when it lies under the watched
+        data path or is reachable through a symlink under it (the symlink map);
+        everything else is outside the observation scope and dropped.
         """
         if self._in_data_path(path):
             return self._canonicalize(path)
         pool_path = self._remap_volume_path(path)
         if pool_path is None:
+            try:
+                path.relative_to(self.pool.mount)
+            except ValueError:
+                return None
+            pool_path = path
+        canon = self._canonicalize(pool_path)
+        if canon is None:
             return None
-        return self._canonicalize(pool_path)
+        if self._in_data_path(canon) or canon in self._symlink_map:
+            return canon
+        return None
 
     def _parse_line(self, line: str) -> ReadEvent | None:
         m = _LINE_RE.match(line)
@@ -1790,7 +1827,7 @@ class Collector:
             pass
 
         try:
-            rel = path.relative_to(self.data_path)
+            rel = path.relative_to(self.pool.mount)
         except ValueError:
             self._branch_for_path[path] = None
             return None

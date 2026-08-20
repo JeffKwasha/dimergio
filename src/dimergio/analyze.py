@@ -12,7 +12,6 @@ def analyze(
     data_path: Path | None = None,
     force_move: bool = False,
 ) -> AnalysisResult:
-    dp = data_path or pool.mount
     fastest = pool.fastest_branch
     fastest_idx = pool.branches.index(fastest) if fastest in pool.branches else -1
 
@@ -32,7 +31,7 @@ def analyze(
         if acc.write_count > 0:
             continue  # files written during observation are ineligible to move
 
-        rel = _safe_relative(acc.path, dp)
+        rel = _safe_relative(acc.path, pool.mount)
         try:
             file_size = acc.path.stat().st_size
         except OSError:

@@ -30,11 +30,11 @@ def load_stats(pool: Pool) -> dict[str, dict]:
         return {}
 
 
-def load_accumulators(pool: Pool, data_path: Path) -> dict[Path, FileAccumulator]:
+def load_accumulators(pool: Pool) -> dict[Path, FileAccumulator]:
     raw = load_stats(pool)
     result: dict[Path, FileAccumulator] = {}
     for rel_str, entry in raw.items():
-        full_path = data_path / rel_str
+        full_path = pool.mount / rel_str
         acc = FileAccumulator(
             path=full_path,
             branch_idx=0,
@@ -49,12 +49,12 @@ def load_accumulators(pool: Pool, data_path: Path) -> dict[Path, FileAccumulator
 def merge_stats(
     existing: dict[str, dict],
     accumulators: dict[Path, FileAccumulator],
-    data_path: Path,
+    pool: Pool,
 ) -> dict[str, dict]:
     result = dict(existing)
     for acc in accumulators.values():
         try:
-            rel = str(acc.path.relative_to(data_path))
+            rel = str(acc.path.relative_to(pool.mount))
         except ValueError:
             rel = acc.path.name
         if rel in result:
