@@ -13,6 +13,7 @@ and reader thread are now owned together by ``start_fatrace``/
 reader). These tests lock that behavior in without needing a real terminal.
 """
 
+import shutil
 import subprocess
 import threading
 from unittest import mock
@@ -136,6 +137,70 @@ def test_normalize_key_ordinary_keys_unchanged():
     assert _normalize_key("\n") == "\n"
     assert _normalize_key("\x1b") == "\x1b"
     assert _normalize_key(" ") == " "
+
+
+# ─── terminfo resolution (broad compatibility) ───────────────────────
+_FAKE_INFOCMP = "\n".join([
+    "\tkcub1=\\EOD,",
+    "\tkcud1=\\EOB,",
+    "\tkcuf1=\\EOC,",
+    "\tkcuu1=\\EOA,",
+    "\tkend=\\EOF,",
+    "\tkhome=\\EOH,",
+    "\tknp=\\E[6~,",
+    "\tkpp=\\E[5~,",
+    "\tka1=\\EOP,",   # F1-style app-keypad: ignored (not a navigation cap)
+])
+
+
+def _fake_run(args, **_kwargs):
+    return subprocess.CompletedProcess(args, 0, stdout=_FAKE_INFOCMP, stderr="")
+
+
+def test_decode_terminfo_escapes():
+    from dimergio.collector import _decode_terminfo_escapes
+
+    assert _decode_terminfo_escapes(r"\E[D") == "\x1b[D"
+    assert _decode_terminfo_escapes(r"\E[1~") == "\x1b[1~"
+    assert _decode_terminfo_escapes(r"^I") == "\t"
+    assert _decode_terminfo_escapes(r"\s") == " "
+    assert _decode_terminfo_escapes(r"\E\023") == "\x1b\x13"
+
+
+def test_terminfo_keymap_uses_infocmp_for_current_term():
+    """Broad compatibility: key sequences come from the *current* $TERM's
+    terminfo entry, not from a fixed table."""
+    import os
+
+    from dimergio.collector import _terminfo_keymap
+
+    with mock.patch.object(os.environ, "get", return_value="xterm-256color"), \
+            mock.patch.object(shutil, "which", return_value="/usr/bin/infocmp"), \
+            mock.patch.object(subprocess, "run", side_effect=_fake_run):
+        keymap = _terminfo_keymap()
+    assert keymap == {
+        "\x1bOD": "\x1b[D", "\x1bOB": "\x1b[B", "\x1bOC": "\x1b[C",
+        "\x1bOA": "\x1b[A", "\x1bOF": "\x1b[F", "\x1bOH": "\x1b[H",
+        "\x1b[6~": "\x1b[6~", "\x1b[5~": "\x1b[5~",
+    }
+
+
+def test_terminfo_keymap_falls_back_to_none():
+    """No TERM, missing infocmp, or an unknown terminal must yield None so the
+    kitty-compatible dialect normalizer is used instead."""
+    import os
+
+    from dimergio.collector import _terminfo_keymap
+
+    with mock.patch.object(os.environ, "get", return_value=""):
+        assert _terminfo_keymap() is None
+    with mock.patch.object(os.environ, "get", return_value="xterm-256color"), \
+            mock.patch.object(shutil, "which", return_value=None):
+        assert _terminfo_keymap() is None
+    with mock.patch.object(os.environ, "get", return_value="weirdterm"), \
+            mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")), \
+            mock.patch.object(shutil, "which", return_value="/usr/bin/infocmp"):
+        assert _terminfo_keymap() is None
 
 
 # ─── _apply_nav: the shared navigation source of truth ──────────────

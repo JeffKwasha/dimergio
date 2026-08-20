@@ -106,6 +106,89 @@ def _normalize_key(seq: str) -> str:
     return seq
 
 
+# terminfo capabilities whose sequences are mapped to the canonical keys.
+# Capability → canonical readchar key (the values in _Keys.NAV etc.).
+_TERMINFO_KEY_CAPS = {
+    "kcub1": "\x1b[D",   # cursor left
+    "kcuf1": "\x1b[C",   # cursor right
+    "kcuu1": "\x1b[A",   # cursor up
+    "kcud1": "\x1b[B",   # cursor down
+    "khome": "\x1b[H",   # home
+    "kend":  "\x1b[F",   # end
+    "kpp":   "\x1b[5~",  # page up
+    "knp":   "\x1b[6~",  # page down
+}
+
+
+def _decode_terminfo_escapes(val: str) -> str:
+    """Decode infocmp's escaped capability string (``\\E[D``, ``^X``, ``\\s``,
+    octal ``\\023``, ``\\\\``) into the literal byte string."""
+    out: list[str] = []
+    i = 0
+    while i < len(val):
+        c = val[i]
+        if c == "\\" and i + 1 < len(val):
+            n = val[i + 1]
+            if n in "01234567":
+                j = i + 1
+                while j < len(val) and j < i + 4 and val[j] in "01234567":
+                    j += 1
+                out.append(chr(int(val[i + 1 : j], 8)))
+                i = j
+                continue
+            simple = {"E": "\x1b", "s": " ", "\\": "\\", "n": "\n",
+                      "t": "\t", "r": "\r", "b": "\b", "f": "\f", "0": "\x00"}
+            if n in simple:
+                out.append(simple[n])
+                i += 2
+                continue
+        if c == "^" and i + 1 < len(val):
+            out.append(chr(ord(val[i + 1]) & 0x1F))
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _terminfo_keymap() -> dict[str, str] | None:
+    """Resolve the current terminal's key sequences from its terminfo entry.
+
+    Broad compatibility: instead of assuming one escape-sequence dialect, we
+    ask ``infocmp`` what THIS terminal actually sends for each navigation key
+    and map those bytes onto the canonical keys the handlers compare against.
+
+    Returns ``{raw_sequence: canonical_key}``, or ``None`` when the lookup is
+    impossible (no ``TERM``, no ``infocmp``, unknown terminal) — in which case
+    the caller falls back to the built-in ``_normalize_key`` dialect table,
+    which is kitty-compatible.
+    """
+    term = os.environ.get("TERM", "")
+    if not term or shutil.which("infocmp") is None:
+        return None
+    try:
+        out = subprocess.run(
+            ["infocmp", "-1", term],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    keymap: dict[str, str] = {}
+    for line in out.stdout.splitlines():
+        line = line.strip().rstrip(",")
+        name, sep, val = line.partition("=")
+        if not sep or name not in _TERMINFO_KEY_CAPS:
+            continue
+        seq = _decode_terminfo_escapes(val)
+        if seq:
+            keymap[seq] = _TERMINFO_KEY_CAPS[name]
+    return keymap or None
+
+
 class _Keys:
     """Single source of truth for every interactive keybinding.
 
@@ -1408,14 +1491,19 @@ class Collector:
 
         _key_q: "queue.Queue[str | None]" = queue.Queue()
         _stop_reader = threading.Event()
+        # Broad compatibility: the actual sequences come from this terminal's
+        # terminfo entry. When that can't be resolved, _normalize_key's
+        # kitty-compatible dialect table is the fallback.
+        _keymap = _terminfo_keymap()
 
         def _read_raw_key() -> str | None:
             """Read a single keystroke directly from the raw terminal.
 
             Assembles escape sequences ourselves (mirroring readchar.readkey()
             but avoiding its TCSAFLUSH which drops buffered keystrokes) and
-            normalizes every dialect — CSI, SS3/application-mode, xterm
-            alternate, and kitty CSI-u — to the canonical readchar constants.
+            decodes them to the canonical readchar constants — first against
+            this terminal's terminfo entry, then the built-in dialect table
+            (CSI, SS3/application-mode, xterm alternate, kitty CSI-u).
             """
             try:
                 ch = sys.stdin.read(1)
@@ -1441,6 +1529,8 @@ class Collector:
                     seq += sys.stdin.read(1)
                 except (OSError, ValueError):
                     pass
+                if _keymap and seq in _keymap:
+                    return _keymap[seq]
                 return _normalize_key(seq)
 
             # CSI: consume parameters (digits/;) until the final byte.
@@ -1454,6 +1544,8 @@ class Collector:
                 seq += c
                 if c not in "\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39;":
                     break
+            if _keymap and seq in _keymap:
+                return _keymap[seq]
             return _normalize_key(seq)
 
         def _key_reader() -> None:
