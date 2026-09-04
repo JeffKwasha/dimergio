@@ -522,14 +522,16 @@ listed in iowait-debt order, with FROM/TO columns color-coded by speed class and
 per-file size plus a total. `Enter` confirms and calls `execute_move_plan()`;
 `Esc` returns to BROWSE; `q` (twice within 4s) quits without executing.
 
-### 7.4.2 Post-move summary and free prompt
+### 7.4.2 Post-move summary and redundant-originals note
 
 After `execute_move_plan()` returns, `cmd_watch` prints a color-coded operations
-table and the total bytes copied — shown in **MB**, or **GB** when over 10GB. It
-then prompts whether to free the redundant renamed originals (`_dimergio_` prefix).
-Answering `y` deletes them and removes the state entries (so they leave `undo`);
-`N` keeps them for later `cleanup` or `undo`. The prompt appears whenever at least
-one file was moved, even if zero bytes were copied (rename-only moves).
+table and the total bytes copied — shown in **MB**, or **GB** when over 10GB. No
+free-originals prompt is shown; the redundant renamed originals (`_dimergio_`
+prefix) are kept so the user can test their program first. `_note_free_originals`
+reports how many redundant originals were left behind and names the command to
+verify & free them later: `dimergio cleanup --pool <mount> -d` (or `dimergio
+undo` to revert). The note appears whenever at least one redundant original was
+left behind, even if zero bytes were copied (rename-only moves).
 
 ### 7.5 Scrolling
 
@@ -677,8 +679,8 @@ Done: 37 moved, 1 failed. 5.2GB copied to ssd_branch.
 Original files renamed with prefix _dimergio_.
 
 Restart your program and test. If everything works, run:
-  dimergio cleanup --pool /mnt/pool
-to delete the originals.
+  dimergio cleanup --pool /mnt/pool -d
+to verify & delete the originals.
 ```
 
 ## 9. State Management (state.py)

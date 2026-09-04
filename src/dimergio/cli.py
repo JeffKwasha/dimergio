@@ -101,7 +101,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             cfg = load_config()
             summary = execute_move_plan(collector.move_plans, pool, prefix=cfg.get("prefix", "_dimergio_"), verify=args.verify)
             _, moved = _print_results(summary, pool)
-            _offer_free_originals(pool, cfg.get("prefix", "_dimergio_"), moved)
+            _note_free_originals(pool, moved)
     else:
         collector = Collector(
             pool=pool,
@@ -122,7 +122,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             cfg = load_config()
             summary = execute_move_plan(collector.move_plans, pool, prefix=cfg.get("prefix", "_dimergio_"), verify=args.verify)
             _, moved = _print_results(summary, pool)
-            _offer_free_originals(pool, cfg.get("prefix", "_dimergio_"), moved)
+            _note_free_originals(pool, moved)
 
         if accumulators:
             from .stats import load_stats, merge_stats, save_stats
@@ -410,9 +410,9 @@ def _print_results(summary, pool) -> tuple[int, list[str]]:
     return succeeded, moved_paths
 
 
-def _offer_free_originals(pool, prefix: str, moved_paths: list[str]) -> None:
-    """After moves, offer to delete the now-redundant renamed originals
-    for the files moved in this session only."""
+def _note_free_originals(pool, moved_paths: list[str]) -> None:
+    """After moves, note the redundant renamed originals left behind and
+    point at the command that can verify & free them later."""
     if not moved_paths:
         return
     ctx = PoolContext(pool)
@@ -441,17 +441,8 @@ def _offer_free_originals(pool, prefix: str, moved_paths: list[str]) -> None:
     if not to_free:
         return
 
-    ans = input(f"\nFree {len(to_free)} redundant original file(s) ({_fmt_bytes(total)})? [y/N]: ").strip().lower()
-    if ans in ("y", "yes"):
-        for e, renamed in to_free:
-            try:
-                renamed.unlink()
-                state.remove(e.pool_path)
-                print(f"  Freed: {e.source_branch}/{e.pool_path}")
-            except OSError as ex:
-                print(f"  Error freeing {renamed}: {ex}")
-    else:
-        print("  Kept originals. Run 'dimergio cleanup' to verify & free later, or 'dimergio undo' to revert.")
+    print(f"\n{len(to_free)} redundant original file(s) ({_fmt_bytes(total)}) kept on the source branch.")
+    print(f"To verify & free them, run 'dimergio cleanup --pool {ctx.mount} -d'; 'dimergio undo' reverts.")
 
 
 def build_parser() -> argparse.ArgumentParser:

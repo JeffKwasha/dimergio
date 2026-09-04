@@ -102,9 +102,10 @@ only the fast-branch copy. Smart rename: if file already on target branch,
 just swaps prefix (no copy needed).
 
 After the operations complete, a color-coded operations list and the total
-bytes copied (MB, or GB if over 10GB) are shown. You are then asked whether
-to free the redundant renamed originals — say `y` to delete them (this also
-removes them from `undo`), or `N` to keep them for later `cleanup`/`undo`.
+bytes copied (MB, or GB if over 10GB) are shown. The redundant renamed
+originals are kept so you can test your program first; you're told how to
+verify & free them later with `dimergio cleanup --pool <pool> -d` (or revert
+with `dimergio undo`).
 
 ```
 Executing 2 moves...
@@ -118,11 +119,12 @@ Original files renamed with prefix '_dimergio_'.
 **4. Verify** — restart your program and test. If everything works:
 
 ```bash
-dimergio cleanup --pool /mnt/pool
+dimergio cleanup --pool /mnt/pool -d
 ```
 
-Walks through unverified migrations older than 7 days and asks you to
-confirm each one. Use `-a` to skip prompting or `-d` to change the day filter.
+Walks through unverified migrations and asks you to
+confirm each one. Use `-a` to skip prompting or `-d` to change the day filter
+(omitting the number means 0 days, so fresh moves are included).
 
 ```bash
 dimergio undo --pool /mnt/pool

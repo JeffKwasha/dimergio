@@ -106,7 +106,7 @@ def execute_move_plan(
             print(f"Original files renamed with prefix '{prefix}'.")
             print()
             print("Restart your program and test. If everything works, run:")
-            print(f"  dimergio cleanup --pool {pool.mount}")
+            print(f"  dimergio cleanup --pool {pool.mount} -d")
     else:
         print("No files were moved.")
 
@@ -137,7 +137,7 @@ def _smart_rename(
         source_branch=src_label,
         target_branch=dst_label,
         original_basename=src_path.name,
-        renamed_basename=dst_path.name,
+        renamed_basename=renamed_name,
         moved_at=datetime.now(tz=timezone.utc).isoformat(),
         file_size=dst_path.stat().st_size,
     )
