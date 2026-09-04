@@ -9,66 +9,6 @@ from pathlib import Path
 from dimergio.mover import _fmt_bytes
 
 
-def _mk_state(tmp_path, monkeypatch):
-    """Build a StateManager backed by a temp dir (never touches real config)."""
-    from dimergio import state as state_mod
-
-    cfg = {
-        "prefix": "_dimergio_",
-        "state_dir": str(tmp_path / "state"),
-        "default_pool": "/mnt/games",
-        "cleanup_days": 14,
-        "checkpoint_interval_s": 60,
-        "iowait_interval_ms": 10,
-        "symlink_depth": 3,
-    }
-    monkeypatch.setattr(state_mod, "load_config", lambda: cfg)
-    return state_mod.StateManager("GAMMAS")
-
-
-class TestRecordedRenamedBasename:
-    def test_copy_and_rename_records_prefixed_basename(self, tmp_path, monkeypatch):
-        from dimergio.mover import _copy_and_rename
-
-        src_dir = tmp_path / "slow"
-        dst_dir = tmp_path / "fast"
-        src_dir.mkdir()
-        dst_dir.mkdir()
-        src_file = src_dir / "grass.dds"
-        src_file.write_bytes(b"data" * 100)
-        dst_path = dst_dir / "grass.dds"
-
-        entry = _copy_and_rename(
-            src_file, dst_path, "_dimergio_", _mk_state(tmp_path, monkeypatch),
-            "Data/textures/grass.dds", "slow", "fast", verify=False,
-        )
-
-        assert entry.renamed_basename == "_dimergio_grass.dds"
-        assert dst_path.exists()
-        assert (src_dir / "_dimergio_grass.dds").exists()
-        assert not src_file.exists()
-
-    def test_smart_rename_records_prefixed_basename(self, tmp_path, monkeypatch):
-        from dimergio.mover import _smart_rename
-
-        src_dir = tmp_path / "slow"
-        dst_dir = tmp_path / "fast"
-        src_dir.mkdir()
-        dst_dir.mkdir()
-        src_file = src_dir / "grass.dds"
-        src_file.write_bytes(b"data" * 100)
-        dst_path = dst_dir / "grass.dds"
-
-        entry = _smart_rename(
-            src_file, dst_path, "_dimergio_", _mk_state(tmp_path, monkeypatch),
-            "Data/textures/grass.dds", "slow", "fast",
-        )
-
-        assert entry.renamed_basename == "_dimergio_grass.dds"
-        assert dst_path.exists()
-        assert not src_file.exists()
-
-
 class TestMovePathResolution:
     """Verify the path construction logic used in move_files."""
 

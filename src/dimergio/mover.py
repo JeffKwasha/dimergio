@@ -81,19 +81,16 @@ def execute_move_plan(
             continue
 
         try:
-            if plan.is_rename_only:
-                entry = _smart_rename(src_path, dst_path, prefix, state, str(rel), src_branch.label, dst_branch.label)
-            else:
-                entry = _copy_and_rename(src_path, dst_path, prefix, state, str(rel), src_branch.label, dst_branch.label, verify)
+            entry = _copy_and_rename(src_path, dst_path, prefix, state, str(rel), src_branch.label, dst_branch.label, verify)
 
-            copied = 0 if plan.is_rename_only else entry.file_size
+            copied = entry.file_size
             total_bytes += copied
             operations.append({"pool_path": str(rel), "src": src_branch.label, "dst": dst_branch.label, "bytes": copied, "ok": True})
             print(f"  {i}/{total} \u2713 {label:<50s}  {src_branch.label} \u2192 {dst_branch.label}  {_fmt_bytes(copied)}")
             succeeded += 1
 
         except OSError as e:
-            if dst_path.exists() and not plan.is_rename_only:
+            if dst_path.exists():
                 dst_path.unlink(missing_ok=True)
             print(f"  {i}/{total} \u2717 {label:<50s}  {e}")
             failed.append(str(rel))
@@ -113,36 +110,7 @@ def execute_move_plan(
     return succeeded, len(failed), failed, operations, total_bytes
 
 
-def _smart_rename(
-    src_path: Path,
-    dst_path: Path,
-    prefix: str,
-    state: StateManager,
-    pool_path: str,
-    src_label: str,
-    dst_label: str,
-) -> MoveEntry:
-    renamed_name = f"{prefix}{src_path.name}"
-    renamed_path = src_path.parent / renamed_name
 
-    if renamed_path.exists():
-        renamed_path.rename(dst_path)
-    elif src_path.exists():
-        src_path.rename(dst_path)
-    else:
-        raise OSError(f"source not found: {src_path}")
-
-    entry = MoveEntry(
-        pool_path=pool_path,
-        source_branch=src_label,
-        target_branch=dst_label,
-        original_basename=src_path.name,
-        renamed_basename=renamed_name,
-        moved_at=datetime.now(tz=timezone.utc).isoformat(),
-        file_size=dst_path.stat().st_size,
-    )
-    state.add(entry)
-    return entry
 
 
 def _copy_and_rename(

@@ -148,7 +148,6 @@ class MoveEntry:
 class MovePlan:
     file: FileAccumulator
     target_branch_idx: int
-    is_rename_only: bool  # True if file was previously on target branch
 
 
 @dataclass(slots=True)

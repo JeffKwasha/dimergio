@@ -223,7 +223,7 @@ def test_mover_dry_run_symlink_escape_blob(tmp_path, monkeypatch):
     pool = _subdir_pool(tmp_path)
     blob = tmp_path / "pool" / "huggingface" / "hub" / "models--x--GGUF" / "blobs" / "176a6a3f"
     acc = FileAccumulator(path=blob, branch_idx=0, total_reads=10, iowait_debt=2.0)
-    plan = MovePlan(file=acc, target_branch_idx=1, is_rename_only=False)
+    plan = MovePlan(file=acc, target_branch_idx=1)
 
     succeeded, failed, failed_list, operations, total_bytes = execute_move_plan(
         [plan], pool, dry_run=True

@@ -1494,7 +1494,6 @@ class Collector:
                     pending_plans.append(MovePlan(
                         file=acc,
                         target_branch_idx=tidx,
-                        is_rename_only=False,
                     ))
                 in_preview = True
             return False
