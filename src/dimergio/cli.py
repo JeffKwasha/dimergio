@@ -7,8 +7,17 @@ from pathlib import Path
 
 from .collector import Collector
 from .config import load as load_config
+from .model import fmt_bytes, speed_color
 from .mover import execute_move_plan
-from .pool import PoolContext, find_pool, find_pool_for_cwd
+from .pool import (
+    PoolContext,
+    branch_holding,
+    find_pool,
+    find_pool_for_cwd,
+    read_mounts,
+    resolve_tracked,
+    volume_mounts,
+)
 from .state import StateManager
 
 logger = logging.getLogger(__name__)
@@ -162,7 +171,7 @@ def cmd_status(args: argparse.Namespace) -> None:
             e.pool_path,
             f"[{sc}]{status}[/{sc}]",
             e.moved_at[:19],
-            _fmt_bytes(e.file_size),
+            fmt_bytes(e.file_size),
         )
 
     Console().print(table)
@@ -243,42 +252,13 @@ def cmd_undo(args: argparse.Namespace) -> None:
 
 
 def _parse_log(log_path: Path, pool, data_path: Path) -> dict:
-    from .collector import _LINE_RE, build_volume_mounts, remap_volume_path
+    from .collector import _LINE_RE
     from .model import FileAccumulator
     import os as _os
 
     my_uid = _os.getuid()
-    volume_mounts = build_volume_mounts(pool)
+    mounts = volume_mounts(pool, read_mounts())
     accumulators: dict[Path, FileAccumulator] = {}
-
-    def _canonical(path: Path) -> Path | None:
-        """Pool-space canonical location of ``path``, or None outside the pool."""
-        real = path.resolve()
-        try:
-            real.relative_to(pool.mount)
-            return real
-        except ValueError:
-            pass
-        for branch in pool.branches:
-            try:
-                rel = real.relative_to(branch.path)
-            except ValueError:
-                continue
-            return pool.mount / rel
-        return None
-
-    def _resolve_tracked(path: Path) -> Path | None:
-        """Map a raw log path to its tracked pool-space canonical path."""
-        if path.is_relative_to(data_path):
-            canon = _canonical(path)
-        else:
-            pool_path = remap_volume_path(path, volume_mounts, pool.mount)
-            if pool_path is None:
-                return None
-            canon = _canonical(pool_path)
-        if canon is None or not canon.is_relative_to(data_path):
-            return None
-        return canon
 
     with open(log_path) as f:
         for line in f:
@@ -292,31 +272,23 @@ def _parse_log(log_path: Path, pool, data_path: Path) -> dict:
                 continue
             if int(m.group("uid")) != my_uid:
                 continue
-            path = Path(m.group("path"))
             try:
-                file_path = _resolve_tracked(path)
+                file_path = resolve_tracked(pool, Path(m.group("path")), data_path, mounts)
             except (OSError, ValueError):
                 continue
             if file_path is None:
                 continue
 
-            branch_idx = 0
-            try:
-                rel = file_path.relative_to(pool.mount)
-            except ValueError:
+            branch_idx = branch_holding(pool, file_path)
+            if branch_idx is None:
                 continue
-            for idx, branch in enumerate(pool.branches):
-                if (branch.path / rel).exists():
-                    branch_idx = idx
-                    break
 
             ts = float(m.group("ts"))
-            key = file_path
-            if key in accumulators:
-                acc = accumulators[key]
+            if file_path in accumulators:
+                acc = accumulators[file_path]
             else:
-                acc = FileAccumulator(path=key, branch_idx=branch_idx, first_seen=ts)
-                accumulators[key] = acc
+                acc = FileAccumulator(path=file_path, branch_idx=branch_idx, first_seen=ts)
+                accumulators[file_path] = acc
             acc.observe(ts, 0.0)
 
     return accumulators
@@ -353,16 +325,6 @@ def _undo_one(ctx: PoolContext, entry, state: StateManager) -> None:
     state.remove(entry.pool_path)
 
 
-def _fmt_bytes(b: int) -> str:
-    if b >= 1 << 30:
-        return f"{b / (1<<30):.1f}GB"
-    if b >= 1 << 20:
-        return f"{b / (1<<20):.0f}MB"
-    if b >= 1 << 10:
-        return f"{b / (1<<10):.0f}KB"
-    return f"{b}B"
-
-
 def _branch_speed_class(pool, label: str) -> str:
     for b in pool.branches:
         if b.label == label:
@@ -380,7 +342,6 @@ def _print_results(summary, pool) -> tuple[int, list[str]]:
     from rich.console import Console
     from rich.table import Table
 
-    color = {"hdd": "blue", "ssd": "teal", "nvme": "green"}
     console = Console()
     table = Table(title="Move operations", show_header=True, header_style="bold", expand=False)
     table.add_column("#", justify="right", width=4)
@@ -390,15 +351,15 @@ def _print_results(summary, pool) -> tuple[int, list[str]]:
     table.add_column("COPIED", justify="right", width=10, no_wrap=True)
 
     for i, op in enumerate(operations, 1):
-        sc = color.get(_branch_speed_class(pool, op["src"]), "red")
-        dc = color.get(_branch_speed_class(pool, op["dst"]), "red")
+        sc = speed_color(_branch_speed_class(pool, op["src"]))
+        dc = speed_color(_branch_speed_class(pool, op["dst"]))
         if op["ok"]:
             table.add_row(
                 str(i),
                 f"[{sc}]{op['src']}[/{sc}]",
                 f"[{dc}]{op['dst']}[/{dc}]",
                 op["pool_path"],
-                _fmt_bytes(op["bytes"]),
+                fmt_bytes(op["bytes"]),
             )
             moved_paths.append(op["pool_path"])
         else:
@@ -406,7 +367,7 @@ def _print_results(summary, pool) -> tuple[int, list[str]]:
 
     console.print(table)
     unit = "GB" if total_bytes > 10 * (1 << 30) else "MB"
-    console.print(f"[bold]Total copied:[/bold] {_fmt_bytes(total_bytes)} ({unit})  —  {succeeded} moved, {failed} failed")
+    console.print(f"[bold]Total copied:[/bold] {fmt_bytes(total_bytes)} ({unit})  —  {succeeded} moved, {failed} failed")
     return succeeded, moved_paths
 
 
@@ -441,7 +402,7 @@ def _note_free_originals(pool, moved_paths: list[str]) -> None:
     if not to_free:
         return
 
-    print(f"\n{len(to_free)} redundant original file(s) ({_fmt_bytes(total)}) kept on the source branch.")
+    print(f"\n{len(to_free)} redundant original file(s) ({fmt_bytes(total)}) kept on the source branch.")
     print(f"To verify & free them, run 'dimergio cleanup --pool {ctx.mount} -d'; 'dimergio undo' reverts.")
 
 

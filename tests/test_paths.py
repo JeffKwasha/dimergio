@@ -1,10 +1,11 @@
-"""Tests for canonical path resolution, the symlink display map, and
-move-time source validation.
+"""Canonical path resolution, the symlink display map, move-time source
+validation, and the shared pool-space helpers.
 
 These cover the real-world failure where a tracked path only existed as a
 mergerfs/symlink artifact: moves used to fail with a wrong branch path. The
-fix canonicalizes tracked paths to the real file and shows a human-readable
-symlink name in the UI while keeping the real path for the move.
+resolver canonicalizes tracked paths to the real file, shows a human-readable
+symlink name in the UI, and keeps the real path for the move. The helper tests
+pin that a live watch and an offline log replay track the same files.
 """
 
 import os
@@ -13,7 +14,7 @@ from pathlib import Path
 from dimergio.collector import Collector, IOWaitSampler
 from dimergio.model import Branch, Pool, ReadEvent
 from dimergio.mover import _resolve_source
-from dimergio.pool import IO_Domain
+from dimergio.pool import remap_volume_path
 
 
 def _pool(root: Path) -> Pool:
@@ -115,7 +116,7 @@ def test_accumulate_sets_display_name(tmp_path):
         branch_idx=0,
         iowait_sec=0.0,
     )
-    c._accumulate(ev, IOWaitSampler([IO_Domain(devices=[])], [0], 10))
+    c._accumulate(ev, IOWaitSampler([[]], [0], 10))
     acc = c._accumulators[tmp_path / "pool" / "data" / "real.bin"]
     assert acc.display_name == "models/M.bin"
 
@@ -171,11 +172,12 @@ def _huggingface_blob(root: Path) -> Path:
 
 
 def test_remap_volume_path_uses_pool_mount(tmp_path):
-    c = _subdir_collector(tmp_path)
-    c._volume_mounts = [(tmp_path / "volroot", Path("/@/ai"), 0)]
+    mounts = [(tmp_path / "volroot", Path("/@/ai"), 0)]
 
     vol = tmp_path / "volroot" / "@" / "ai" / "huggingface" / "hub" / "f.bin"
-    assert c._remap_volume_path(vol) == tmp_path / "pool" / "huggingface" / "hub" / "f.bin"
+    assert remap_volume_path(vol, mounts, tmp_path / "pool") == (
+        tmp_path / "pool" / "huggingface" / "hub" / "f.bin"
+    )
 
 
 def test_resolve_tracked_symlink_escape_outside_data(tmp_path):
@@ -283,3 +285,124 @@ def test_config_default_symlink_depth():
     from dimergio.config import DEFAULTS
 
     assert DEFAULTS["symlink_depth"] == 3
+
+# ─── shared pool-space helpers (single source for live and offline) ──
+def test_canonical_pool_path_maps_branch_to_pool_space(tmp_path):
+    from dimergio.pool import canonical_pool_path
+
+    pool = _pool(tmp_path)
+    real = _real_file(tmp_path)
+    assert canonical_pool_path(pool, real) == tmp_path / "pool" / "data" / "real.bin"
+    assert canonical_pool_path(pool, tmp_path / "pool" / "data" / "real.bin") == (
+        tmp_path / "pool" / "data" / "real.bin"
+    )
+
+
+def test_canonical_pool_path_rejects_outside_pool(tmp_path):
+    from dimergio.pool import canonical_pool_path
+
+    outside = tmp_path / "elsewhere.bin"
+    outside.write_bytes(b"x")
+    assert canonical_pool_path(_pool(tmp_path), outside) is None
+
+
+def test_canonical_pool_path_caches(tmp_path):
+    from dimergio.pool import canonical_pool_path
+
+    pool = _pool(tmp_path)
+    real = _real_file(tmp_path)
+    cache: dict[Path, Path | None] = {}
+    canonical_pool_path(pool, real, cache)
+    assert cache == {real: tmp_path / "pool" / "data" / "real.bin"}
+
+
+def test_branch_holding_returns_index_or_none(tmp_path):
+    from dimergio.pool import branch_holding
+
+    pool = _pool(tmp_path)
+    _real_file(tmp_path)
+    assert branch_holding(pool, tmp_path / "pool" / "data" / "real.bin") == 0
+    assert branch_holding(pool, tmp_path / "pool" / "ghost" / "x.bin") is None
+
+
+def test_pool_rel_falls_back_to_name(tmp_path):
+    from dimergio.pool import pool_rel
+
+    assert pool_rel(tmp_path / "pool" / "a" / "b.bin", tmp_path / "pool") == "a/b.bin"
+    assert pool_rel(Path("/somewhere/else/b.bin"), tmp_path / "pool") == "b.bin"
+
+
+def test_io_domains_group_branches_by_device_set(tmp_path, monkeypatch):
+    from dimergio import pool as pool_mod
+
+    pool = _pool(tmp_path)
+    devices = {pool.branches[0].path: ["dm-0", "dm-1"], pool.branches[1].path: ["dm-0", "dm-1"]}
+    monkeypatch.setattr(pool_mod, "branch_devices", lambda path, mounts: devices[path])
+
+    domains, branch_to_domain = pool_mod.io_domains(pool.branches, [])
+
+    assert domains == [["dm-0", "dm-1"]]
+    assert branch_to_domain == [0, 0]
+
+
+def test_io_domains_split_distinct_devices(tmp_path, monkeypatch):
+    from dimergio import pool as pool_mod
+
+    pool = _pool(tmp_path)
+    devices = {pool.branches[0].path: ["dm-0"], pool.branches[1].path: []}
+    monkeypatch.setattr(pool_mod, "branch_devices", lambda path, mounts: devices[path])
+
+    domains, branch_to_domain = pool_mod.io_domains(pool.branches, [])
+
+    assert domains == [["dm-0"], []]
+    assert branch_to_domain == [0, 1]
+
+
+def test_offline_log_and_live_watch_track_the_same_symlink_escape(tmp_path):
+    """The offline parser used to drop a file the live collector tracked."""
+    from dimergio.cli import _parse_log
+
+    _huggingface_blob(tmp_path)
+    line = (
+        f"1748573021.456789 app(123) [{os.getuid()}:1000]: R "
+        f"{tmp_path / 'pool' / 'models' / 'Model.gguf'}"
+    )
+
+    live = _subdir_collector(tmp_path)._parse_line(line)
+    assert live is not None
+
+    log = tmp_path / "fatrace.log"
+    log.write_text(line + "\n")
+    offline = _parse_log(log, _subdir_pool(tmp_path), tmp_path / "pool" / "models")
+
+    assert list(offline) == [live.file_path]
+    assert offline[live.file_path].branch_idx == live.branch_idx
+
+
+# ─── mmap faults fold into the same accumulator ─────────────────────
+def test_on_mmap_folds_faults_into_reads_and_iowait(tmp_path):
+    _real_file(tmp_path)
+    pool_path = tmp_path / "pool" / "data" / "real.bin"
+    c = _collector(tmp_path)
+    sampler = IOWaitSampler([[]], [0], 10)
+    c._sampler = sampler
+    c._mmap_watcher.resolve_path = lambda pid, ino: pool_path
+
+    c._on_mmap(99, 1234, 5)
+
+    acc = c._accumulators[tmp_path / "pool" / "data" / "real.bin"]
+    assert acc.total_reads == 5
+    assert c._pid_stats[99].read_count == 5
+    assert sampler._event_counts[0] == 5
+
+
+def test_on_mmap_drops_paths_outside_the_pool(tmp_path):
+    c = _collector(tmp_path)
+    c._sampler = IOWaitSampler([[]], [0], 10)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"x")
+    c._mmap_watcher.resolve_path = lambda pid, ino: outside
+
+    c._on_mmap(99, 1234, 1)
+
+    assert c._accumulators == {}

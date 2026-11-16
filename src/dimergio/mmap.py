@@ -19,7 +19,7 @@ class MmapCandidate:
     read_bytes: int = 0
 
 
-def _proc_comm(pid: int) -> str:
+def proc_comm(pid: int) -> str:
     try:
         return Path(f"/proc/{pid}/comm").read_text().strip()
     except OSError:
@@ -56,6 +56,7 @@ class MmapWatcher:
         path_ok: Callable[[Path], bool],
         use_sudo: bool = False,
         binary: str | None = None,
+        interval_ms: int = 10,
     ) -> None:
         self._path_ok = path_ok
         self._use_sudo = use_sudo
@@ -67,13 +68,12 @@ class MmapWatcher:
         self._ino_cache: dict[int, dict[int, Path]] = {}
         self._candidates: list[MmapCandidate] = []
         self._on_event: Callable[[int, int, int], None] | None = None
-        self._interval_ms = 10
+        self._interval_ms = interval_ms
 
     def _find_binary(self) -> str | None:
-        here = Path(__file__).resolve().parent
-        bundled = here / "bin" / "dimergio-mmap"
-        if bundled.is_file() and os.access(bundled, os.X_OK):
-            return str(bundled)
+        override = os.environ.get("DIMERGIO_MMAP_BIN")
+        if override:
+            return override if os.access(override, os.X_OK) else None
         return shutil.which("dimergio-mmap")
 
     @property
@@ -106,7 +106,7 @@ class MmapWatcher:
             if not entry.isdigit():
                 continue
             pid = int(entry)
-            name = _proc_comm(pid)
+            name = proc_comm(pid)
             if not name:
                 continue
             rb = _proc_io_read_bytes(pid)

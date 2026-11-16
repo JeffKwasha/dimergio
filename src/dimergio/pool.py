@@ -3,20 +3,259 @@ from __future__ import annotations
 import os
 import re
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 from .model import Branch, Pool
 from .state import StateManager
 
+# (source, mountpoint, subvol option) — one entry per mounted filesystem.
+Mount = tuple[str, Path, str]
 
-@dataclass
-class IO_Domain:
-    devices: list[str]
+
+def read_mounts() -> list[Mount]:
+    """Parse /proc/mounts once into the entries every pool helper needs."""
+    mounts: list[Mount] = []
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                subvol = ""
+                for opt in parts[3].split(","):
+                    if opt.startswith("subvol="):
+                        subvol = opt[len("subvol="):]
+                        break
+                mounts.append((parts[0], Path(parts[1]), subvol))
+    except OSError:
+        pass
+    return mounts
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _rel(path: Path, root: Path) -> Path | None:
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        return None
+
+
+def _mount_source(path: Path, mounts: list[Mount]) -> str | None:
+    resolved = path.resolve()
+    for source, mountpoint, _ in mounts:
+        if mountpoint.resolve() == resolved:
+            return source
+    return None
+
+
+def _resolve_device(branch_path: Path, mounts: list[Mount]) -> str | None:
+    """Map a branch path to its dm-X device name."""
+    source = _mount_source(branch_path, mounts)
+    return _dm_name(source) if source else None
+
+
+def _dm_name(device_path: str) -> str | None:
+    """Convert /dev/dm-7 or /dev/mapper/foo to 'dm-7'."""
+    if device_path.startswith("/dev/dm-"):
+        return device_path.removeprefix("/dev/")
+    if device_path.startswith("/dev/mapper/"):
+        try:
+            target = os.readlink(device_path)
+            name = Path(target).name
+            if name.startswith("dm-"):
+                return name
+        except OSError:
+            pass
+    return None
+
+
+def branch_devices(branch_path: Path, mounts: list[Mount]) -> list[str]:
+    """Every dm-X device backing the filesystem mounted at branch_path.
+
+    A branch on a multi-device btrfs pool reports all its member devices; any
+    other mount reports the single device, or [] when it cannot be resolved.
+    """
+    source = _mount_source(branch_path, mounts)
+    dm_name = _dm_name(source) if source else None
+    if dm_name is None:
+        return []
+
+    try:
+        fsid_dirs = list(Path("/sys/fs/btrfs").iterdir())
+    except OSError:
+        return [dm_name]
+    for fsid_dir in fsid_dirs:
+        devices_dir = fsid_dir / "devices"
+        if not devices_dir.is_dir():
+            continue
+        if (devices_dir / dm_name).exists():
+            return sorted(d.name for d in devices_dir.iterdir() if d.is_dir())
+    return [dm_name]
+
+
+def io_domains(branches: list[Branch], mounts: list[Mount]) -> tuple[list[list[str]], list[int]]:
+    """Group branches by the set of block devices that back them.
+
+    Branches sharing a btrfs pool contend for the same device queue, so they
+    form one IO domain. Returns (domain device lists, branch-to-domain index).
+    """
+    by_devices: dict[tuple[str, ...], int] = {}
+    domains: list[list[str]] = []
+    branch_to_domain: list[int] = []
+
+    for branch in branches:
+        devices = branch_devices(branch.path, mounts)
+        key = tuple(devices)
+        idx = by_devices.get(key)
+        if idx is None:
+            idx = len(domains)
+            domains.append(devices)
+            by_devices[key] = idx
+        branch_to_domain.append(idx)
+
+    return domains, branch_to_domain
+
+
+def volume_mounts(pool: Pool, mounts: list[Mount]) -> list[tuple[Path, Path, int]]:
+    """Correlate each branch's subvolume with its parent btrfs volume mount.
+
+    fatrace reports paths through the volume mount (e.g.
+    /mnt/dev/HGST_r1/@/games/…), while the pool/branch uses a subvolume mount
+    (e.g. /mnt/@/r1_games/…). Returns [(vol_root, subvol_rel, branch_idx)].
+    """
+    result: list[tuple[Path, Path, int]] = []
+    for idx, branch in enumerate(pool.branches):
+        branch_dev = None
+        branch_subvol = ""
+        for source, mountpoint, subvol in mounts:
+            if mountpoint == branch.path:
+                branch_dev, branch_subvol = source, subvol
+                break
+        if not branch_dev or not branch_subvol:
+            continue
+        vol_root = None
+        for source, mountpoint, subvol in mounts:
+            if source == branch_dev and subvol in ("", "/"):
+                vol_root = mountpoint
+                break
+        if vol_root is not None:
+            result.append((vol_root, Path(branch_subvol), idx))
+    return result
+
+
+def remap_volume_path(path: Path, mounts: list[tuple[Path, Path, int]], pool_mount: Path) -> Path | None:
+    """Convert a raw btrfs volume path to its pool-space equivalent."""
+    for vol_root, subvol_rel, _ in mounts:
+        rel = _rel(subvol_rel, Path("/"))
+        if rel is None:
+            continue
+        prefix = vol_root / rel
+        pool_rel_path = _rel(path, prefix)
+        if pool_rel_path is not None:
+            return pool_mount / pool_rel_path
+    return None
+
+
+def canonical_pool_path(pool: Pool, path: Path, cache: dict[Path, Path | None] | None = None) -> Path | None:
+    """Resolve path to the real file's pool-space location.
+
+    Symlinks are resolved. A real path under the pool mount is returned as-is;
+    a real path on a branch mount is mapped back to its pool equivalent
+    (pool.mount / branch_rel). None means the path escapes the pool.
+    """
+    if cache is not None and path in cache:
+        return cache[path]
+
+    try:
+        real = path.resolve()
+    except OSError:
+        real = path
+
+    result: Path | None = None
+    if _is_under(real, pool.mount):
+        result = real
+    else:
+        for branch in pool.branches:
+            rel = _rel(real, branch.path)
+            if rel is not None:
+                result = pool.mount / rel
+                break
+
+    if cache is not None:
+        cache[path] = result
+    return result
+
+
+def resolve_tracked(
+    pool: Pool,
+    path: Path,
+    data_path: Path,
+    mounts: list[tuple[Path, Path, int]] = (),
+    extra_targets: object = (),
+) -> Path | None:
+    """Map an observed path to its tracked pool-space canonical path.
+
+    Paths under the watched data path are tracked whatever they resolve to.
+    Paths reported elsewhere are first remapped from a raw btrfs volume path,
+    then accepted only when the real file lives under the data path or is one
+    of ``extra_targets`` (symlink targets the user can see inside it).
+    """
+    if _is_under(path, data_path):
+        return canonical_pool_path(pool, path)
+
+    source = remap_volume_path(path, mounts, pool.mount) if mounts else None
+    if source is None:
+        if not _is_under(path, pool.mount):
+            return None
+        source = path
+
+    canonical = canonical_pool_path(pool, source)
+    if canonical is None:
+        return None
+    if _is_under(canonical, data_path) or canonical in extra_targets:
+        return canonical
+    return None
+
+
+def branch_holding(pool: Pool, path: Path, cache: dict[Path, int | None] | None = None) -> int | None:
+    """Index of the branch that holds ``path``, or None when none does.
+
+    None is not a guess: paths recorded through a symlink or mergerfs artifact
+    have no real location on any branch, and callers drop them instead of
+    attributing I/O to the wrong device.
+    """
+    if cache is not None and path in cache:
+        return cache[path]
+
+    idx: int | None = None
+    rel = _rel(path, pool.mount)
+    if rel is not None:
+        for i, branch in enumerate(pool.branches):
+            if (branch.path / rel).exists():
+                idx = i
+                break
+
+    if cache is not None:
+        cache[path] = idx
+    return idx
+
+
+def pool_rel(path: Path, mount: Path) -> str:
+    """Pool-relative string for ``path``, falling back to its name."""
+    rel = _rel(path, mount)
+    return str(rel) if rel is not None else path.name
 
 
 def discover_pools() -> list[Pool]:
     pools_by_mount: dict[str, Pool] = {}
+    mounts = read_mounts()
 
     for proc_dir in Path("/proc").iterdir():
         if not proc_dir.name.isdigit():
@@ -52,7 +291,7 @@ def discover_pools() -> list[Pool]:
         for bp in branch_paths:
             if not bp.exists():
                 continue
-            dev = _resolve_device(bp)
+            dev = _resolve_device(bp, mounts)
             rotational = True
             if dev:
                 rot_path = Path(f"/sys/block/{dev}/queue/rotational")
@@ -110,99 +349,6 @@ def find_pool_for_cwd() -> Pool | None:
             except ValueError:
                 continue
     return None
-
-
-def _resolve_device(branch_path: Path) -> str | None:
-    """Map a branch path to its dm-X device name."""
-    # Get mount source from /proc/mounts
-    resolved = branch_path.resolve()
-    with open("/proc/mounts") as f:
-        for line in f:
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            mp = Path(parts[1]).resolve()
-            if mp == resolved:
-                dev = parts[0]
-                return _dm_name(dev)
-    return None
-
-
-def _dm_name(device_path: str) -> str | None:
-    """Convert /dev/dm-7 or /dev/mapper/foo to 'dm-7'."""
-    if device_path.startswith("/dev/dm-"):
-        return device_path.removeprefix("/dev/")
-    if device_path.startswith("/dev/mapper/"):
-        try:
-            target = os.readlink(device_path)
-            name = Path(target).name
-            if name.startswith("dm-"):
-                return name
-        except OSError:
-            pass
-    return None
-
-
-def _resolve_btrfs_devices(branch_path: Path) -> list[str]:
-    """Return all dm-X device names backing the btrfs pool at branch_path.
-
-    For non-btrfs mounts this returns the single device (or [] if un-resolvable).
-    """
-    resolved = branch_path.resolve()
-    mount_source = None
-    with open("/proc/mounts") as f:
-        for line in f:
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            mp = Path(parts[1]).resolve()
-            if mp == resolved:
-                mount_source = parts[0]
-                break
-    if mount_source is None:
-        return []
-
-    dm_name = _dm_name(mount_source)
-    if dm_name is None:
-        return []
-
-    btrfs_root = Path("/sys/fs/btrfs")
-    try:
-        for fsid_dir in btrfs_root.iterdir():
-            if not fsid_dir.is_dir() or fsid_dir.name == "features":
-                continue
-            devices_dir = fsid_dir / "devices"
-            if not devices_dir.is_dir():
-                continue
-            if (devices_dir / dm_name).exists():
-                return sorted(d.name for d in devices_dir.iterdir() if d.is_dir())
-    except OSError:
-        pass
-
-    return [dm_name]
-
-
-def _build_io_domains(branches: list[Branch]) -> tuple[list[IO_Domain], list[int]]:
-    """Group branches by their backing device set.
-
-    Returns (domains, br2domain) where br2domain[i] = domain index for branch i.
-    Branches on the same btrfs pool share a domain.
-    """
-    branch_devices: list[list[str]] = [_resolve_btrfs_devices(b.path) for b in branches]
-    seen: dict[tuple[str, ...], int] = {}
-    domains: list[IO_Domain] = []
-    br2domain: list[int] = []
-
-    for devs in branch_devices:
-        key = tuple(devs)
-        idx = seen.get(key)
-        if idx is None:
-            idx = len(domains)
-            domains.append(IO_Domain(devices=list(devs)))
-            seen[key] = idx
-        br2domain.append(idx)
-
-    return domains, br2domain
 
 
 class PoolContext:

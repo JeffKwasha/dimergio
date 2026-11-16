@@ -1,9 +1,7 @@
 from pathlib import Path
 
 from dimergio.model import (
-    AnalysisResult,
     Branch,
-    Candidate,
     FileAccumulator,
     MoveEntry,
     Pool,
@@ -93,60 +91,6 @@ class TestFileAccumulator:
         assert acc.last_seen == 200.0
 
 
-class TestCandidate:
-    def test_size_display_bytes(self):
-        c = Candidate(
-            path=Path("/f"),
-            pool_path="f",
-            reads=1,
-            iowait_debt=0.0,
-            iowait_pct=0.0,
-            cum_pct=0.0,
-            branch_name="test",
-            file_size=500,
-        )
-        assert c.size_display == "500B"
-
-    def test_size_display_kb(self):
-        c = Candidate(
-            path=Path("/f"),
-            pool_path="f",
-            reads=1,
-            iowait_debt=0.0,
-            iowait_pct=0.0,
-            cum_pct=0.0,
-            branch_name="test",
-            file_size=2048,
-        )
-        assert c.size_display == "2KB"
-
-    def test_size_display_mb(self):
-        c = Candidate(
-            path=Path("/f"),
-            pool_path="f",
-            reads=1,
-            iowait_debt=0.0,
-            iowait_pct=0.0,
-            cum_pct=0.0,
-            branch_name="test",
-            file_size=5 * 1024 * 1024,
-        )
-        assert c.size_display == "5MB"
-
-    def test_size_display_gb(self):
-        c = Candidate(
-            path=Path("/f"),
-            pool_path="f",
-            reads=1,
-            iowait_debt=0.0,
-            iowait_pct=0.0,
-            cum_pct=0.0,
-            branch_name="test",
-            file_size=3 * 1024 * 1024 * 1024,
-        )
-        assert c.size_display == "3.0GB"
-
-
 class TestMoveEntry:
     def test_default_verified_none(self):
         e = MoveEntry(
@@ -189,19 +133,3 @@ class TestReadEvent:
         assert e.file_path.name == "f.dat"
         assert e.iowait_sec == 0.075
         assert e.process_name == "myapp"
-
-
-class TestAnalysisResult:
-    def test_empty_candidates(self):
-        pool = Pool(mount=Path("/p"), name="P")
-        result = AnalysisResult(
-            candidates=[],
-            total_reads=0,
-            total_iowait=0.0,
-            threshold_80_idx=0,
-            total_candidate_reads=0,
-            total_candidate_iowait=0.0,
-            observation_duration_s=0.0,
-            pool=pool,
-        )
-        assert len(result.candidates) == 0

@@ -10,6 +10,31 @@ from pathlib import Path
 # a physical constant — tune per device if needed.
 SSD_BLOCK_BYTES = 128 * 1024
 
+# Speed class → Rich color name, shared by every panel that color-codes branches.
+SPEED_COLORS = {"hdd": "blue", "ssd": "teal", "nvme": "green"}
+
+
+def speed_color(speed_class: str) -> str:
+    return SPEED_COLORS.get(speed_class, "white")
+
+
+
+def effective_size_bytes(sz: int) -> int:
+    """Physical cost floor for comparison: file size rounded up to the SSD
+    block size, with a minimum of one block."""
+    return max(SSD_BLOCK_BYTES, ((sz + SSD_BLOCK_BYTES - 1) // SSD_BLOCK_BYTES) * SSD_BLOCK_BYTES)
+
+
+def fmt_bytes(b: int) -> str:
+    if b >= 1 << 30:
+        return f"{b / (1<<30):.1f}GB"
+    if b >= 1 << 20:
+        return f"{b / (1<<20):.0f}MB"
+    if b >= 1 << 10:
+        return f"{b / (1<<10):.0f}KB"
+    return f"{b}B"
+
+
 
 @dataclass(slots=True, unsafe_hash=True)
 class Branch:
@@ -108,31 +133,6 @@ class PidStat:
 
 
 @dataclass(slots=True)
-class Candidate:
-    path: Path
-    pool_path: str          # relative path within pool
-    reads: int
-    iowait_debt: float
-    iowait_pct: float       # % of total iowait
-    cum_pct: float          # cumulative % across all candidates
-    branch_name: str
-    file_size: int
-    effective_size: int = 0     # file size rounded up to SSD block, min one block
-    iowait_per_mb: float = 0.0  # iowait_debt / (effective_size in MB)
-
-    @property
-    def size_display(self) -> str:
-        b = self.file_size
-        if b >= 1 << 30:
-            return f"{b / (1<<30):.1f}GB"
-        if b >= 1 << 20:
-            return f"{b / (1<<20):.0f}MB"
-        if b >= 1 << 10:
-            return f"{b / (1<<10):.0f}KB"
-        return f"{b}B"
-
-
-@dataclass(slots=True)
 class MoveEntry:
     pool_path: str
     source_branch: str
@@ -148,15 +148,3 @@ class MoveEntry:
 class MovePlan:
     file: FileAccumulator
     target_branch_idx: int
-
-
-@dataclass(slots=True)
-class AnalysisResult:
-    candidates: list[Candidate]
-    total_reads: int
-    total_iowait: float
-    threshold_80_idx: int   # index into candidates where 80% is reached
-    total_candidate_reads: int
-    total_candidate_iowait: float
-    observation_duration_s: float
-    pool: Pool

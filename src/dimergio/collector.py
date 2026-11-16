@@ -12,9 +12,26 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .model import FileAccumulator, PidStat, Pool, ReadEvent, SSD_BLOCK_BYTES
-from .pool import IO_Domain
-from .mmap import _proc_comm
+from .model import (
+    FileAccumulator,
+    PidStat,
+    Pool,
+    ReadEvent,
+    effective_size_bytes,
+    fmt_bytes,
+    speed_color,
+)
+from .mmap import proc_comm
+from .pool import (
+    branch_holding,
+    canonical_pool_path,
+    io_domains,
+    pool_rel,
+    read_mounts,
+    resolve_tracked,
+    volume_mounts,
+)
+from .tui_keys import Keys, apply_nav, normalize_key, terminfo_keymap
 
 logger = logging.getLogger(__name__)
 
@@ -33,316 +50,10 @@ _LINE_RE = re.compile(
 )
 
 
-def _effective_size_bytes(sz: int) -> int:
-    """Physical cost floor for comparison: file size rounded up to the SSD
-    block size, with a minimum of one block."""
-    return max(SSD_BLOCK_BYTES, ((sz + SSD_BLOCK_BYTES - 1) // SSD_BLOCK_BYTES) * SSD_BLOCK_BYTES)
-
-
 def _cycle_sort_key(current: str, direction: int, keys: tuple[str, ...]) -> str:
     """Rotate the active sort column by `direction` (-1 left, +1 right)."""
     idx = keys.index(current)
     return keys[(idx + direction) % len(keys)]
-
-
-def build_volume_mounts(pool: Pool) -> list[tuple[Path, Path, int]]:
-    """Map raw btrfs volume mount paths → pool branches.
-
-    fatrace reports paths through the btrfs volume mount (e.g.
-    /mnt/dev/HGST_r1/@/games/…), but the pool/branch uses a subvolume mount
-    (e.g. /mnt/@/r1_games/…).  This parses /proc/mounts to correlate each
-    branch to its parent volume mount + subvol path. Returns
-    ``[(vol_root, subvol_rel, branch_idx), ...]``.
-    """
-    mounts: list[tuple[str, Path, str]] = []
-    try:
-        with open("/proc/mounts") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) < 4 or parts[2] != "btrfs":
-                    continue
-                opts = parts[3].split(",")
-                subvol = ""
-                for o in opts:
-                    if o.startswith("subvol="):
-                        subvol = o[7:]
-                        break
-                mounts.append((parts[0], Path(parts[1]), subvol))
-    except OSError:
-        return []
-
-    volume_mounts: list[tuple[Path, Path, int]] = []
-    for idx, branch in enumerate(pool.branches):
-        branch_dev = None
-        branch_subvol = None
-        for dev, mp, subvol in mounts:
-            if mp == branch.path:
-                branch_dev = dev
-                branch_subvol = subvol
-                break
-        if not branch_dev:
-            continue
-        vol_root = None
-        for dev, mp, subvol in mounts:
-            if dev == branch_dev and subvol in ("", "/"):
-                vol_root = mp
-                break
-        if vol_root is not None and branch_subvol:
-            volume_mounts.append((vol_root, Path(branch_subvol), idx))
-    return volume_mounts
-
-
-def remap_volume_path(
-    path: Path,
-    volume_mounts: list[tuple[Path, Path, int]],
-    pool_mount: Path,
-) -> Path | None:
-    """Convert a raw btrfs volume path to a pool-relative path.
-
-    fatrace reports /mnt/dev/HGST_r1/@/games/file — remap to
-    /mnt/games/file (pool-relative).
-    """
-    for vol_root, subvol_rel, _ in volume_mounts:
-        try:
-            rel = subvol_rel.relative_to(Path("/"))
-        except ValueError:
-            continue
-        prefix = vol_root / rel
-        try:
-            pool_rel = path.relative_to(prefix)
-        except ValueError:
-            continue
-        return pool_mount / pool_rel
-    return None
-
-
-_CSI_U_KEYS = {
-    "1": "\x1b[H",   # Home
-    "4": "\x1b[F",   # End
-    "5": "\x1b[5~",  # PageUp
-    "6": "\x1b[6~",  # PageDown
-    "9": "\t",       # Tab
-    "13": "\n",      # Enter
-    "27": "\x1b",    # Esc
-    "32": " ",       # Space
-}
-
-
-def _csiu_to_key(code: str) -> str:
-    """Map a kitty CSI-u key code (e.g. ``27`` from ``\x1b[27;5u``) to the
-    canonical readchar key. Unknown codes pass through as ``\x1b[<code>u``."""
-    base = code.split(";", 1)[0]
-    return _CSI_U_KEYS.get(base, "\x1b[" + base + "u")
-
-
-def _normalize_key(seq: str) -> str:
-    """Normalize any terminal's escape-sequence dialect to the canonical
-    readchar key constants the handlers compare against.
-
-    Covers the common modes dimergio can be launched under: plain CSI arrows
-    (``\x1b[A``), application-cursor mode (SS3 ``\x1bOA``), xterm alternate
-    Home/End (``\x1b[1~``/``\x1b[4~``), modified arrows (``\x1b[1;5A``), and
-    the kitty keyboard protocol (CSI-u, e.g. ``\x1b[1;1A`` / ``\x1b[27u``).
-    Modifiers are stripped so Shift/Ctrl+arrow still navigates/sorts.
-    """
-    if len(seq) < 3 or not seq.startswith("\x1b"):
-        return seq
-    if seq.startswith("\x1bO"):
-        # SS3/application-cursor mode: ESC O <letter> → ESC [ <letter>.
-        return "\x1b[" + seq[2:]
-    if not seq.startswith("\x1b["):
-        return seq
-    body = seq[2:]
-    if body.endswith("u"):
-        # Kitty CSI-u: ESC [ <code> [; <modifier>] u.
-        return _csiu_to_key(body[:-1])
-    final = body[-1]
-    if final in "ABCDHF":
-        # Arrows / Home / End, possibly with a parameter prefix (kitty
-        # ``\x1b[1;1A``, xterm ``\x1b[1;5A``, DEC ``\x1b[1A``) — the plain
-        # key is enough for navigation/sort.
-        return "\x1b[" + final
-    if final == "~":
-        # ESC [ <num> [; <mod>] ~  (PageUp/Down, alternate Home/End).
-        nums = [p for p in body[:-1].split(";") if p.isdigit()]
-        num = nums[0] if nums else ""
-        if num in ("1", "7"):
-            return "\x1b[H"
-        if num in ("4", "8"):
-            return "\x1b[F"
-        if num in ("5",):
-            return "\x1b[5~"
-        if num in ("6",):
-            return "\x1b[6~"
-    return seq
-
-
-# terminfo capabilities whose sequences are mapped to the canonical keys.
-# Capability → canonical readchar key (the values in _Keys.NAV etc.).
-_TERMINFO_KEY_CAPS = {
-    "kcub1": "\x1b[D",   # cursor left
-    "kcuf1": "\x1b[C",   # cursor right
-    "kcuu1": "\x1b[A",   # cursor up
-    "kcud1": "\x1b[B",   # cursor down
-    "khome": "\x1b[H",   # home
-    "kend":  "\x1b[F",   # end
-    "kpp":   "\x1b[5~",  # page up
-    "knp":   "\x1b[6~",  # page down
-}
-
-
-def _decode_terminfo_escapes(val: str) -> str:
-    """Decode infocmp's escaped capability string (``\\E[D``, ``^X``, ``\\s``,
-    octal ``\\023``, ``\\\\``) into the literal byte string."""
-    out: list[str] = []
-    i = 0
-    while i < len(val):
-        c = val[i]
-        if c == "\\" and i + 1 < len(val):
-            n = val[i + 1]
-            if n in "01234567":
-                j = i + 1
-                while j < len(val) and j < i + 4 and val[j] in "01234567":
-                    j += 1
-                out.append(chr(int(val[i + 1 : j], 8)))
-                i = j
-                continue
-            simple = {"E": "\x1b", "s": " ", "\\": "\\", "n": "\n",
-                      "t": "\t", "r": "\r", "b": "\b", "f": "\f", "0": "\x00"}
-            if n in simple:
-                out.append(simple[n])
-                i += 2
-                continue
-        if c == "^" and i + 1 < len(val):
-            out.append(chr(ord(val[i + 1]) & 0x1F))
-            i += 2
-            continue
-        out.append(c)
-        i += 1
-    return "".join(out)
-
-
-def _terminfo_keymap() -> dict[str, str] | None:
-    """Resolve the current terminal's key sequences from its terminfo entry.
-
-    Broad compatibility: instead of assuming one escape-sequence dialect, we
-    ask ``infocmp`` what THIS terminal actually sends for each navigation key
-    and map those bytes onto the canonical keys the handlers compare against.
-
-    Returns ``{raw_sequence: canonical_key}``, or ``None`` when the lookup is
-    impossible (no ``TERM``, no ``infocmp``, unknown terminal) — in which case
-    the caller falls back to the built-in ``_normalize_key`` dialect table,
-    which is kitty-compatible.
-    """
-    term = os.environ.get("TERM", "")
-    if not term or shutil.which("infocmp") is None:
-        return None
-    try:
-        out = subprocess.run(
-            ["infocmp", "-1", term],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return None
-    keymap: dict[str, str] = {}
-    for line in out.stdout.splitlines():
-        line = line.strip().rstrip(",")
-        name, sep, val = line.partition("=")
-        if not sep or name not in _TERMINFO_KEY_CAPS:
-            continue
-        seq = _decode_terminfo_escapes(val)
-        if seq:
-            keymap[seq] = _TERMINFO_KEY_CAPS[name]
-    return keymap or None
-
-
-class _Keys:
-    """Single source of truth for every interactive keybinding.
-
-    All key constants, lookup maps, and the on-screen help hints live here so
-    the handlers and the rendered legend can never drift apart. Built once per
-    session (needs ``readchar.key`` constants, imported lazily).
-    """
-
-    def __init__(self) -> None:
-        from readchar import key as k
-
-        self.QUIT = ("q", "Q")
-        self.ENTER = k.ENTER
-        self.ESC = k.ESC
-        self.SPACE = k.SPACE
-        self.TAB = k.TAB
-        self.SORT_LEFT = k.LEFT
-        self.SORT_RIGHT = k.RIGHT
-        self.CLEAR_MARK = "-"
-        self.CLEAR_STATS = "c"
-        self.SHOW_EXITED = "s"
-        self.SAMPLE_DOWN = "["
-        self.SAMPLE_UP = "]"
-        self.NAND = "M"
-        self.MMAP = "m"
-
-        # TAB switches focus between the file list and the process list
-        # (Home/End kept as aliases). Arrow keys navigate within a list and
-        # Left/Right re-sort whichever panel is focused.
-        self.FOCUS_TOGGLE = k.TAB
-        self.FOCUS_PROCS = k.HOME
-        self.FOCUS_FILES = k.END
-
-        # Arrow/paging keys → navigation verbs understood by _apply_nav.
-        self.NAV = {
-            k.UP: "up",
-            k.DOWN: "down",
-            k.PAGE_UP: "page_up",
-            k.PAGE_DOWN: "page_down",
-        }
-
-        # Sort columns cycled with Left/Right; order defines rotation.
-        self.SORT = ("iowait_per_mb", "iowait", "reads")
-        self.PROC_SORT = ("mmap", "reads", "iowait")
-
-        # Help hints rendered as panel subtitles. Kept next to the bindings so
-        # a change to a key forces a change to its documentation.
-        self.BROWSE_HINT = (
-            "↑↓:scroll  ←/→:sort  Tab:files/procs  Space:mark  "
-            "Enter:review  -:clear  c:clear stats  s:show-exited  "
-            "m:mmap []:sample  M:nand  q:quit"
-        )
-        self.PREVIEW_HINT = "Enter: execute  Esc: back  q: quit"
-
-
-def _apply_nav(scroll: int, selected: int, n: int, max_vis: int, key: str) -> tuple[int, int]:
-    """Pure file-list navigation.
-
-    Returns the new (scroll, selected) given the current values, the total
-    number of rows ``n``, the visible window size ``max_vis`` and a key
-    string (compared against ``readchar.key`` constants by the caller).
-
-    Unknown keys leave state unchanged. This is the single source of truth
-    for scrolling in both monitor and select modes, so navigation behaves
-    identically everywhere and can be unit-tested without a terminal.
-    """
-    if n <= 0:
-        return 0, 0
-    if key == "up":
-        selected = max(0, selected - 1)
-        if selected < scroll:
-            scroll = selected
-    elif key == "down":
-        selected = min(n - 1, selected + 1)
-        if selected >= scroll + max_vis:
-            scroll = selected - max_vis + 1
-    elif key == "page_up":
-        scroll = max(0, scroll - max_vis)
-        selected = scroll
-    elif key == "page_down":
-        scroll = min(max(0, n - max_vis), scroll + max_vis)
-        selected = min(n - 1, scroll + max_vis - 1)
-    return scroll, selected
 
 
 def _read_diskstats() -> dict[str, int]:
@@ -383,7 +94,7 @@ class IOWaitSampler:
 
     def __init__(
         self,
-        domains: list[IO_Domain],
+        domains: list[list[str]],
         br2domain: list[int],
         interval_ms: int = 10,
         debug_log: Path | None = None,
@@ -426,11 +137,6 @@ class IOWaitSampler:
         self._interval_ms = ms
         self._interval = ms / 1000
 
-    def record_event(self, branch_idx: int) -> None:
-        domain_idx = self._br2domain[branch_idx]
-        with self._lock:
-            self._event_counts[domain_idx] += 1
-
     def record_events(self, branch_idx: int, n: int) -> None:
         """Accumulate ``n`` read events for one branch in a single lock take."""
         domain_idx = self._br2domain[branch_idx]
@@ -465,47 +171,50 @@ class IOWaitSampler:
 
     def _run(self) -> None:
         initial = _read_diskstats()
-        for domain in self._domains:
-            for dev in domain.devices:
+        for devices in self._domains:
+            for dev in devices:
                 self._prev_ticks[dev] = initial.get(dev, 0)
 
         while not self._stop.is_set():
             self._stop.wait(self._interval)
+            self._sample_once(_read_diskstats())
 
-            stats = _read_diskstats()
-            timestamp = datetime.datetime.now().isoformat()
-            with self._lock:
-                for domain_idx, domain in enumerate(self._domains):
-                    total_delta = 0
-                    for dev in domain.devices:
-                        curr = stats.get(dev)
-                        if curr is None:
-                            continue
-                        prev = self._prev_ticks.get(dev, curr)
-                        self._prev_ticks[dev] = curr
-                        delta = curr - prev
-                        if delta >= 0:
-                            total_delta += delta
+    def _sample_once(self, stats: dict[str, int]) -> None:
+        """Fold one diskstats snapshot into the per-domain shares."""
+        timestamp = datetime.datetime.now().isoformat()
+        with self._lock:
+            for domain_idx, devices in enumerate(self._domains):
+                total_delta = 0
+                for dev in devices:
+                    curr = stats.get(dev)
+                    if curr is None:
+                        continue
+                    prev = self._prev_ticks.get(dev, curr)
+                    self._prev_ticks[dev] = curr
+                    delta = curr - prev
+                    if delta >= 0:
+                        total_delta += delta
 
-                    self._pending_ms[domain_idx] += total_delta
-                    self._total_iowait_ms += total_delta
+                pending_ms = self._pending_ms[domain_idx] + total_delta
+                self._pending_ms[domain_idx] = pending_ms
+                self._total_iowait_ms += total_delta
 
-                    cnt = self._event_counts[domain_idx]
-                    if cnt > 0:
-                        self._share_ms[domain_idx] = self._pending_ms[domain_idx] / cnt
-                    else:
-                        self._share_ms[domain_idx] = 0.0
+                cnt = self._event_counts[domain_idx]
+                if cnt > 0:
+                    self._share_ms[domain_idx] = pending_ms / cnt
+                else:
+                    self._share_ms[domain_idx] = 0.0
 
-                    self._pending_ms[domain_idx] = 0.0
-                    self._event_counts[domain_idx] = 0
+                self._pending_ms[domain_idx] = 0.0
+                self._event_counts[domain_idx] = 0
 
-                    if self._debug_fh is not None:
-                        self._debug_fh.write(
-                            f"{timestamp} {domain_idx} {','.join(domain.devices)} "
-                            f"{self._pending_ms[domain_idx]:.1f} "
-                            f"{self._share_ms[domain_idx]:.3f} {cnt}\n"
-                        )
-                        self._debug_fh.flush()
+                if self._debug_fh is not None:
+                    self._debug_fh.write(
+                        f"{timestamp} {domain_idx} {','.join(devices)} "
+                        f"{pending_ms:.1f} "
+                        f"{self._share_ms[domain_idx]:.3f} {cnt}\n"
+                    )
+                    self._debug_fh.flush()
 
 
 class Collector:
@@ -538,7 +247,6 @@ class Collector:
         self._stop_flag = threading.Event()
         self._branch_for_path: dict[Path, int | None] = {}
         self._no_interactive = no_interactive
-        self._volume_mounts: list[tuple[Path, Path, int]] = []
         self._written_paths: set[Path] = set()
         self._verbose = verbose
         self._debug_log = debug_log
@@ -550,6 +258,7 @@ class Collector:
         self.mmap_pids = mmap_pids or []
         self._sampler: IOWaitSampler | None = None
         self.symlink_depth = symlink_depth
+        self._volume_mounts = volume_mounts(pool, read_mounts())
         # Canonicalized-path cache (per session; paths do not change location
         # while we run) and the one-time symlink reverse map (shortest wins).
         self._resolved_paths: dict[Path, Path | None] = {}
@@ -559,18 +268,8 @@ class Collector:
         self._mmap_watcher = MmapWatcher(
             path_ok=lambda p: self._resolve_tracked_path(p) is not None,
             use_sudo=use_sudo,
+            interval_ms=iowait_interval_ms,
         )
-        self._build_volume_map()
-
-    def _build_volume_map(self) -> None:
-        """Map raw btrfs volume mount paths → branch paths.
-
-        fatrace reports paths through the btrfs volume mount (e.g.
-        /mnt/dev/HGST_r1/@/games/…), but the pool/branch uses a
-        subvolume mount (e.g. /mnt/@/r1_games/…).  We parse /proc/mounts
-        to correlate each branch to its parent volume mount + subvol path.
-        """
-        self._volume_mounts = build_volume_mounts(self.pool)
 
     def _build_symlink_map(self) -> dict[Path, str]:
         """One-time reverse map: real file → shortest symlink relpath (from pwd).
@@ -615,48 +314,8 @@ class Collector:
         return result
 
     def _canonicalize(self, path: Path) -> Path | None:
-        """Resolve a path to the real file's canonical pool-relative location.
-
-        Symlinks are fully resolved. The canonical location is expressed in
-        pool space: a real path that resolves under ``pool.mount`` (or
-        ``data_path``) is kept as-is; a path that resolves onto a branch mount
-        is mapped back to its pool equivalent (``pool.mount / branch_rel``).
-        Returns None for paths that escape the pool entirely. Cached per input
-        path.
-        """
-        if path in self._resolved_paths:
-            return self._resolved_paths[path]
-        try:
-            real = path.resolve()
-        except OSError:
-            real = path
-        if self._in_data_path(real) or self._under_pool_mount(real):
-            result: Path | None = real
-        else:
-            result = None
-            for branch in self.pool.branches:
-                try:
-                    rel = real.relative_to(branch.path)
-                except ValueError:
-                    continue
-                result = self.pool.mount / rel
-                break
-        self._resolved_paths[path] = result
-        return result
-
-    def _under_pool_mount(self, path: Path) -> bool:
-        try:
-            path.relative_to(self.pool.mount)
-            return True
-        except ValueError:
-            return False
-
-    def _pool_rel(self, path: Path) -> str:
-        """Pool-relative string for ``path``, falling back to its name."""
-        try:
-            return str(path.relative_to(self.pool.mount))
-        except ValueError:
-            return path.name
+        """Pool-space location of the real file behind ``path``, cached."""
+        return canonical_pool_path(self.pool, path, self._resolved_paths)
 
     def _display_name_for(self, path: Path) -> str:
         """Symlink path for ``path`` when one is indexed, else the rel path."""
@@ -665,7 +324,7 @@ class Collector:
             link = self._symlink_map.get(target)
             if link is not None:
                 return link
-        return self._pool_rel(path)
+        return pool_rel(path, self.pool.mount)
 
     def _ensure_pid_stat(self, pid: int, process_name: str, ts: float) -> PidStat:
         try:
@@ -747,7 +406,7 @@ class Collector:
                 if event is not None:
                     if self._verbose:
                         logger.info("  → event: br=%d pid=%d path=%s", event.branch_idx, event.pid, event.file_path)
-                    sampler.record_event(event.branch_idx)
+                    sampler.record_events(event.branch_idx, 1)
                     self._accumulate(event, sampler)
                 elif self._verbose:
                     logger.info("  → dropped")
@@ -800,9 +459,7 @@ class Collector:
             logger.info("done (preloaded) — %d reads, %d files", nreads, nfiles)
             return self._accumulators
 
-        from .pool import _build_io_domains
-
-        domains, br2domain = _build_io_domains(self.pool.branches)
+        domains, br2domain = io_domains(self.pool.branches, read_mounts())
         sampler = IOWaitSampler(
             domains, br2domain, self.iowait_interval_ms, debug_log=self._debug_log
         )
@@ -871,7 +528,7 @@ class Collector:
             console.print("PIPE not supported")
             return
 
-        KEYS = _Keys()
+        KEYS = Keys()
 
         self._stop_flag.clear()
         start_time = time.time()
@@ -916,18 +573,9 @@ class Collector:
                 return f"{h}:{m:02d}:{s:02d}"
             return f"{m:02d}:{s:02d}"
 
-        def _rel_path(path: Path) -> str:
-            try:
-                return str(path.relative_to(self.pool.mount))
-            except ValueError:
-                return path.name
-
         def _display_label(acc) -> str:
             """Symlink name when one is indexed, else the pool-relative path."""
             return acc.display_name or self._display_name_for(acc.path)
-
-        def _branch_color(sc: str) -> str:
-            return {"hdd": "blue", "ssd": "teal", "nvme": "green"}.get(sc, "red")
 
         def _sort_value(acc, key: str) -> float:
             if key == "iowait_per_mb":
@@ -962,7 +610,7 @@ class Collector:
                 return cached
             from .pool import PoolContext
             state = PoolContext(self.pool).state
-            rel = _rel_path(acc.path)
+            rel = pool_rel(acc.path, self.pool.mount)
             result = any(e.pool_path == rel for e in state.all())
             _multi_branch_cache[acc.path] = result
             return result
@@ -984,7 +632,7 @@ class Collector:
             return sz
 
         def _effective_size(acc) -> int:
-            return _effective_size_bytes(_file_size(acc))
+            return effective_size_bytes(_file_size(acc))
 
         def _iowait_per_mb(acc) -> float:
             """iowait debt normalized by effective physical size (seconds/MB)."""
@@ -995,13 +643,11 @@ class Collector:
                 acc for acc in _sorted_files()
                 if (tidx := file_marks.get(acc.path)) is not None and tidx < len(branches)
             ]
-            # Post-hoc byte-weighting (requirement #2): weight each file's
-            # estimated iowait savings by its physical size relative to the
-            # average marked file, so moving a large slow file counts more
-            # than a tiny one with equal raw iowait. This is an approximation
-            # (fatrace reports no per-event bytes); it only rescales the
-            # existing per-file savings and never changes which files are
-            # marked.
+            # Weight estimated savings by physical size relative to the
+            # marked set's average, so a large slow file counts more than a
+            # tiny one with equal raw iowait. fatrace reports no per-event
+            # bytes, so this only rescales the estimate; it never changes
+            # which files are marked.
             avg_eff = (sum(_effective_size(a) for a in marked) / len(marked)) if marked else 1
 
             total_saved = 0.0
@@ -1018,19 +664,10 @@ class Collector:
                 space[tidx] = space.get(tidx, 0) + sz
             return total_saved, total_time, space
 
-        def _fmt_bytes(b: int) -> str:
-            if b >= 1 << 30:
-                return f"{b / (1<<30):.1f}GB"
-            if b >= 1 << 20:
-                return f"{b / (1<<20):.0f}MB"
-            if b >= 1 << 10:
-                return f"{b / (1<<10):.0f}KB"
-            return f"{b}B"
-
         def _branch_legend() -> Text:
             parts = []
             for i, b in enumerate(branches):
-                c = _branch_color(b.speed_class)
+                c = speed_color(b.speed_class)
                 parts.append(f"[{c}]{i}:{b.short_label}({b.speed_weight}x)[/{c}]")
             return Text.from_markup("  ".join(parts))
 
@@ -1104,7 +741,7 @@ class Collector:
 
             tiers_line = Text.from_markup(
                 f"[bold]Tiers:[/bold]  " + "  ".join(
-                    f"[{_branch_color(b.speed_class)}]{i}:{b.short_label}({b.speed_weight}x)[/{_branch_color(b.speed_class)}]"
+                    f"[{speed_color(b.speed_class)}]{i}:{b.short_label}({b.speed_weight}x)[/{speed_color(b.speed_class)}]"
                     for i, b in enumerate(branches)
                 )
                 + f"   [dim]M:nand:[/dim]{'ON' if nand_warn else 'OFF'}"
@@ -1143,7 +780,7 @@ class Collector:
                         proc_table.add_row(
                             name[:18],
                             f"{reads:,}" if reads else "-",
-                            _fmt_bytes(mmap_b) if mmap_b else "-",
+                            fmt_bytes(mmap_b) if mmap_b else "-",
                             f"{stat.total_iowait_sec:.3f}" if stat else "-",
                             _STYLE[st],
                             style=row_style,
@@ -1173,12 +810,12 @@ class Collector:
                 for rank, acc in enumerate(visible_files, file_scroll + 1):
                     br = branches[acc.branch_idx] if acc.branch_idx < len(branches) else branches[0]
                     from_label = br.short_label + ("…" if _on_multiple_branches(acc) else "")
-                    from_c = _branch_color(br.speed_class)
+                    from_c = speed_color(br.speed_class)
 
                     tidx = file_marks.get(acc.path)
                     if tidx is not None and tidx < len(branches):
                         tgt = branches[tidx]
-                        to_cell = f"[{_branch_color(tgt.speed_class)}]{tgt.short_label}[/{_branch_color(tgt.speed_class)}]"
+                        to_cell = f"[{speed_color(tgt.speed_class)}]{tgt.short_label}[/{speed_color(tgt.speed_class)}]"
                     else:
                         to_cell = "[dim]-[/dim]"
 
@@ -1190,7 +827,7 @@ class Collector:
                         f"{_iowait_per_mb(acc):.4f}",
                         f"[{from_c}]{from_label}[/{from_c}]",
                         to_cell,
-                        _fmt_bytes(_file_size(acc)),
+                        fmt_bytes(_file_size(acc)),
                         _display_label(acc),
                         style=row_style,
                     )
@@ -1205,11 +842,11 @@ class Collector:
             total_r = sum(tier_reads) or 1
             total_io = sum(tier_iowait) or 1.0
             reads_parts = [
-                f"[{_branch_color(b.speed_class)}]{b.short_label} {tier_reads[i]:,} ({tier_reads[i] / total_r * 100:.0f}%)[/{_branch_color(b.speed_class)}]"
+                f"[{speed_color(b.speed_class)}]{b.short_label} {tier_reads[i]:,} ({tier_reads[i] / total_r * 100:.0f}%)[/{speed_color(b.speed_class)}]"
                 for i, b in enumerate(branches)
             ]
             iowait_parts = [
-                f"[{_branch_color(b.speed_class)}]{b.short_label} {tier_iowait[i]:.1f}s ({tier_iowait[i] / total_io * 100:.0f}%)[/{_branch_color(b.speed_class)}]"
+                f"[{speed_color(b.speed_class)}]{b.short_label} {tier_iowait[i]:.1f}s ({tier_iowait[i] / total_io * 100:.0f}%)[/{speed_color(b.speed_class)}]"
                 for i, b in enumerate(branches)
             ]
             tier_stats = Text.from_markup(
@@ -1219,7 +856,7 @@ class Collector:
 
             est_saved, est_time, space_req = _calc_select_stats()
             space_parts = [
-                f"[{_branch_color(b.speed_class)}]{b.short_label} {_fmt_bytes(space_req.get(i, 0))}[/{_branch_color(b.speed_class)}]"
+                f"[{speed_color(b.speed_class)}]{b.short_label} {fmt_bytes(space_req.get(i, 0))}[/{speed_color(b.speed_class)}]"
                 for i, b in enumerate(branches)
             ]
             space_line = Text.from_markup(
@@ -1261,18 +898,18 @@ class Collector:
                 tgt = branches[plan.target_branch_idx]
                 sz = _file_size(acc)
                 total += sz
-                sc = _branch_color(src.speed_class)
-                tc = _branch_color(tgt.speed_class)
+                sc = speed_color(src.speed_class)
+                tc = speed_color(tgt.speed_class)
                 table.add_row(
                     str(i),
                     f"[{sc}]{src.short_label}[/{sc}]",
                     f"[{tc}]{tgt.short_label}[/{tc}]",
                     _display_label(acc),
-                    _fmt_bytes(sz),
+                    fmt_bytes(sz),
                 )
 
             header = Text.from_markup(
-                f"[bold]{len(pending_plans)} move(s)[/bold]  total {_fmt_bytes(total)}"
+                f"[bold]{len(pending_plans)} move(s)[/bold]  total {fmt_bytes(total)}"
             )
             qc = _quit_confirm_status()
             status = qc if qc is not None else Text("Enter: execute   Esc: back to browse   q: quit", style="bold yellow")
@@ -1288,7 +925,7 @@ class Collector:
         # All keys are parsed by readchar into complete strings (see the
         # reader thread below), so handlers only ever see whole keystrokes
         # — never a half-read escape sequence. Every binding is defined once
-        # on the KEYS object (see _Keys), so handlers and the on-screen legend
+        # on the KEYS object, so handlers and the on-screen legend
         # can never drift apart.
 
         def _nav_file(key: str) -> bool:
@@ -1299,7 +936,7 @@ class Collector:
                 return False
             n = len(_sorted_files())
             max_vis = _visible_rows()
-            file_scroll, file_selected = _apply_nav(file_scroll, file_selected, n, max_vis, kind)
+            file_scroll, file_selected = apply_nav(file_scroll, file_selected, n, max_vis, kind)
             return True
 
         def _proc_rows() -> list[tuple[int, str, int, int, str]]:
@@ -1343,7 +980,7 @@ class Collector:
             if kind is None:
                 return False
             rows = _proc_visible_rows()
-            proc_scroll, proc_selected = _apply_nav(proc_scroll, proc_selected, len(rows), 8, kind)
+            proc_scroll, proc_selected = apply_nav(proc_scroll, proc_selected, len(rows), 8, kind)
             return True
 
         def _set_flash(msg: str) -> None:
@@ -1529,9 +1166,9 @@ class Collector:
         _key_q: "queue.Queue[str | None]" = queue.Queue()
         _stop_reader = threading.Event()
         # Broad compatibility: the actual sequences come from this terminal's
-        # terminfo entry. When that can't be resolved, _normalize_key's
+        # terminfo entry. When that can't be resolved, normalize_key's
         # kitty-compatible dialect table is the fallback.
-        _keymap = _terminfo_keymap()
+        _keymap = terminfo_keymap()
 
         def _read_raw_key() -> str | None:
             """Read a single keystroke directly from the raw terminal.
@@ -1568,7 +1205,7 @@ class Collector:
                     pass
                 if _keymap and seq in _keymap:
                     return _keymap[seq]
-                return _normalize_key(seq)
+                return normalize_key(seq)
 
             # CSI: consume parameters (digits/;) until the final byte.
             while True:
@@ -1583,7 +1220,7 @@ class Collector:
                     break
             if _keymap and seq in _keymap:
                 return _keymap[seq]
-            return _normalize_key(seq)
+            return normalize_key(seq)
 
         def _key_reader() -> None:
             while not _stop_reader.is_set():
@@ -1632,38 +1269,15 @@ class Collector:
             t.join(timeout=1)
             termios.tcsetattr(_fd, termios.TCSADRAIN, _old_term)
 
-    def _remap_volume_path(self, path: Path) -> Path | None:
-        """Convert a raw btrfs volume path to a pool-relative path.
-
-        fatrace reports /mnt/dev/HGST_r1/@/games/file — remap to
-        /mnt/games/file  (pool-relative).
-        """
-        return remap_volume_path(path, self._volume_mounts, self.pool.mount)
-
     def _resolve_tracked_path(self, path: Path) -> Path | None:
-        """Map any observed path to the canonical pool-relative file path.
-
-        Symlink, raw btrfs volume, and plain pool paths are normalized to the
-        real file's pool-space location, so moves always target the actual file
-        (never a symlink). A file is tracked only when it lies under the watched
-        data path or is reachable through a symlink under it (the symlink map);
-        everything else is outside the observation scope and dropped.
-        """
-        if self._in_data_path(path):
-            return self._canonicalize(path)
-        pool_path = self._remap_volume_path(path)
-        if pool_path is None:
-            try:
-                path.relative_to(self.pool.mount)
-            except ValueError:
-                return None
-            pool_path = path
-        canon = self._canonicalize(pool_path)
-        if canon is None:
-            return None
-        if self._in_data_path(canon) or canon in self._symlink_map:
-            return canon
-        return None
+        """Tracked pool-space path for an observed frame, or None when out of scope."""
+        return resolve_tracked(
+            self.pool,
+            path,
+            self.data_path,
+            self._volume_mounts,
+            extra_targets=self._symlink_map,
+        )
 
     def _parse_line(self, line: str) -> ReadEvent | None:
         m = _LINE_RE.match(line)
@@ -1701,21 +1315,8 @@ class Collector:
             s.process_name = proc
             # Track write count for this file
             branch_idx = self._resolve_branch(file_path)
-            if branch_idx is None:
-                # File not on any branch (symlink/ghost path) — nothing to
-                # record for a relocatable file; write tracking already done.
-                pass
-            else:
-                try:
-                    acc = self._accumulators[file_path]
-                except KeyError:
-                    acc = FileAccumulator(
-                        path=file_path,
-                        branch_idx=branch_idx,
-                        first_seen=ts,
-                        display_name=self._display_name_for(file_path),
-                    )
-                    self._accumulators[file_path] = acc
+            if branch_idx is not None:
+                acc = self._get_acc(file_path, branch_idx, ts)
                 acc.write_count += 1
                 acc.last_seen = ts
 
@@ -1745,24 +1346,28 @@ class Collector:
             iowait_sec=0.0,
         )
 
+    def _get_acc(self, path: Path, branch_idx: int, ts: float) -> FileAccumulator:
+        """Accumulator for ``path``, created on first sight."""
+        try:
+            return self._accumulators[path]
+        except KeyError:
+            acc = FileAccumulator(
+                path=path,
+                branch_idx=branch_idx,
+                first_seen=ts,
+                display_name=self._display_name_for(path),
+            )
+            self._accumulators[path] = acc
+            return acc
+
     def _accumulate(self, event: ReadEvent, sampler: IOWaitSampler) -> None:
         iowait = sampler.get_busy(event.branch_idx)
         event.iowait_sec = iowait
 
         self._update_pid_stats(event)
-
-        key = event.file_path
-        try:
-            acc = self._accumulators[key]
-        except KeyError:
-            acc = FileAccumulator(
-                path=key,
-                branch_idx=event.branch_idx,
-                first_seen=event.timestamp,
-                display_name=self._display_name_for(key),
-            )
-            self._accumulators[key] = acc
-        acc.observe(event.timestamp, iowait)
+        self._get_acc(event.file_path, event.branch_idx, event.timestamp).observe(
+            event.timestamp, iowait
+        )
 
     def _on_mmap(self, pid: int, ino: int, count: int) -> None:
         """Merge an aggregated mmap page-fault window from the eBPF tracer.
@@ -1786,55 +1391,18 @@ class Collector:
                 logger.info("  mmap: no branch holds %s — dropped", norm)
             return
 
-        s = self._ensure_pid_stat(pid, _proc_comm(pid), ts)
+        comm = proc_comm(pid)
+        s = self._ensure_pid_stat(pid, comm, ts)
         s.read_count += count
         s.last_seen = ts
         if s.write_count == 0:
-            s.process_name = _proc_comm(pid) or s.process_name
+            s.process_name = comm or s.process_name
 
-        try:
-            acc = self._accumulators[norm]
-        except KeyError:
-            acc = FileAccumulator(
-                path=norm,
-                branch_idx=branch_idx,
-                first_seen=ts,
-                display_name=self._display_name_for(norm),
-            )
-            self._accumulators[norm] = acc
+        acc = self._get_acc(norm, branch_idx, ts)
         iowait = self._sampler.get_busy(branch_idx)
         acc.observe_n(ts, iowait, count)
         self._sampler.record_events(branch_idx, count)
 
-    def _in_data_path(self, path: Path) -> bool:
-        try:
-            path.relative_to(self.data_path)
-            return True
-        except ValueError:
-            return False
-
     def _resolve_branch(self, path: Path) -> int | None:
-        """Branch index holding ``path``, or None when no branch has it.
-
-        Returns None (not a guess) when the file cannot be located on any
-        branch — e.g. paths recorded through symlink/mergerfs artifacts. Callers
-        drop such events rather than attributing them to a wrong branch.
-        """
-        try:
-            return self._branch_for_path[path]
-        except KeyError:
-            pass
-
-        try:
-            rel = path.relative_to(self.pool.mount)
-        except ValueError:
-            self._branch_for_path[path] = None
-            return None
-
-        for idx, branch in enumerate(self.pool.branches):
-            if (branch.path / rel).exists():
-                self._branch_for_path[path] = idx
-                return idx
-
-        self._branch_for_path[path] = None
-        return None
+        """Index of the branch holding ``path``, cached, or None when none does."""
+        return branch_holding(self.pool, path, self._branch_for_path)

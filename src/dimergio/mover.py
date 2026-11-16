@@ -6,8 +6,8 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .model import Candidate, MoveEntry, MovePlan, Pool
-from .pool import PoolContext
+from .model import MoveEntry, MovePlan, Pool, fmt_bytes
+from .pool import PoolContext, canonical_pool_path
 from .state import StateManager
 
 
@@ -20,18 +20,15 @@ def _resolve_source(pool: Pool, src_branch, rel: Path) -> tuple[Path, Path]:
 
     Tracked paths are normally canonical, but offline/preloaded data may hold
     symlink paths. We never move a symlink itself: resolve it to the real file
-    and recompute the canonical rel path on whichever branch holds it.
+    and take the canonical rel path of that real location.
     """
     src_path = src_branch.path / rel
     if not src_path.is_symlink() and src_path.exists():
         return src_path, rel
-    real = src_path.resolve()
-    for branch in pool.branches:
-        try:
-            return real, real.relative_to(branch.path)
-        except ValueError:
-            continue
-    return src_path, rel
+    canonical = canonical_pool_path(pool, src_path)
+    if canonical is None:
+        return src_path, rel
+    return src_path.resolve(), canonical.relative_to(pool.mount)
 
 
 def execute_move_plan(
@@ -86,7 +83,7 @@ def execute_move_plan(
             copied = entry.file_size
             total_bytes += copied
             operations.append({"pool_path": str(rel), "src": src_branch.label, "dst": dst_branch.label, "bytes": copied, "ok": True})
-            print(f"  {i}/{total} \u2713 {label:<50s}  {src_branch.label} \u2192 {dst_branch.label}  {_fmt_bytes(copied)}")
+            print(f"  {i}/{total} \u2713 {label:<50s}  {src_branch.label} \u2192 {dst_branch.label}  {fmt_bytes(copied)}")
             succeeded += 1
 
         except OSError as e:
@@ -108,8 +105,6 @@ def execute_move_plan(
         print("No files were moved.")
 
     return succeeded, len(failed), failed, operations, total_bytes
-
-
 
 
 
@@ -169,13 +164,3 @@ def _hash_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def _fmt_bytes(b: int) -> str:
-    if b >= 1 << 30:
-        return f"{b / (1<<30):.1f}GB"
-    if b >= 1 << 20:
-        return f"{b / (1<<20):.0f}MB"
-    if b >= 1 << 10:
-        return f"{b / (1<<10):.0f}KB"
-    return f"{b}B"

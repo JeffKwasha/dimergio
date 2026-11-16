@@ -6,7 +6,7 @@ They operate purely on string/path operations.
 
 from pathlib import Path
 
-from dimergio.mover import _fmt_bytes
+from dimergio.model import fmt_bytes
 
 
 class TestMovePathResolution:
@@ -65,19 +65,19 @@ class TestMovePathResolution:
 
 class TestFmtBytes:
     def test_bytes(self):
-        assert _fmt_bytes(500) == "500B"
+        assert fmt_bytes(500) == "500B"
 
     def test_kb(self):
-        assert _fmt_bytes(2048) == "2KB"
+        assert fmt_bytes(2048) == "2KB"
 
     def test_mb(self):
-        assert _fmt_bytes(5 * 1024 * 1024) == "5MB"
+        assert fmt_bytes(5 * 1024 * 1024) == "5MB"
 
     def test_gb(self):
-        assert _fmt_bytes(3 * 1024 * 1024 * 1024) == "3.0GB"
+        assert fmt_bytes(3 * 1024 * 1024 * 1024) == "3.0GB"
 
     def test_edge_zero(self):
-        assert _fmt_bytes(0) == "0B"
+        assert fmt_bytes(0) == "0B"
 
     def test_edge_one(self):
-        assert _fmt_bytes(1) == "1B"
+        assert fmt_bytes(1) == "1B"

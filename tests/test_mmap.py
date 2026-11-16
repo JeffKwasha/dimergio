@@ -25,7 +25,7 @@ def _watcher(binary: str | None = None) -> MmapWatcher:
 def test_scan_filters_and_sorts(monkeypatch):
     w = _watcher()
     monkeypatch.setattr(os, "listdir", lambda _: ["100", "101", "999", "x"])
-    monkeypatch.setattr(mm, "_proc_comm", lambda pid: "" if pid == 999 else f"p{pid}")
+    monkeypatch.setattr(mm, "proc_comm", lambda pid: "" if pid == 999 else f"p{pid}")
     monkeypatch.setattr(
         mm, "_proc_io_read_bytes", lambda pid: {100: 500, 101: 9000, 999: 100000}[pid]
     )
@@ -42,7 +42,7 @@ def test_scan_filters_and_sorts(monkeypatch):
 def test_scan_skips_process_without_mapping(monkeypatch):
     w = _watcher()
     monkeypatch.setattr(os, "listdir", lambda _: ["1"])
-    monkeypatch.setattr(mm, "_proc_comm", lambda pid: "k")
+    monkeypatch.setattr(mm, "proc_comm", lambda pid: "k")
     monkeypatch.setattr(mm, "_proc_io_read_bytes", lambda pid: 123)
     monkeypatch.setattr(w, "_has_mapping_under_data", lambda pid: False)
     assert w.scan() == []
