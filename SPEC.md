@@ -94,32 +94,37 @@ Parse `/proc/mounts` for filesystems of type `fuse.mergerfs`. Extract:
 
 ### 4.2 Map branches to block devices
 
-For each branch path (e.g. `/mnt/slow`):
+For each branch path (e.g. `/mnt/@/nvme_games`):
 
-1. Look up its mount in `/proc/mounts` → device path (e.g. `/dev/dm-3`)
-2. Extract major:minor via `os.stat(branch)` → `os.major()`, `os.minor()`
-   (fallback: read `/sys/block` by iterating, comparing major:minor from mountinfo)
-3. Identify `dm-X` from the device path
-4. Store mapping: `branch → {device: dm-X, rotational: from /sys/block/dm-X/queue/rotational}`
+1. Find the mount whose mountpoint resolves to the branch path, read once from
+   `/proc/mounts` per session.
+2. Take the mount source and resolve it. The kernel device name is its basename,
+   so `/dev/dm-11` gives `dm-11`, `/dev/nvme0n1p1` gives `nvme0n1p1`, and a
+   `/dev/mapper/...` or `/dev/disk/by-uuid/...` symlink gives whatever it points
+   at.
+3. Read `rotational` from `/sys/block/<device>/queue/rotational`. A partition
+   has no queue of its own, so its parent disk supplies the flag.
+4. Store `branch → {device, rotational, speed_class, speed_weight}`.
+
+A source that is not a `/dev` path (NFS, a loopback string) yields no device,
+and the branch keeps the conservative hdd tier.
 
 ### 4.3 Speed class auto-detection
 
-Each branch is classified into a speed tier based on two signals:
+The rotational flag decides hdd versus flash. The device name only separates
+NVMe from other flash, because both report rotational=0. An md array stays
+conservative: the flag describes the array, not the disks under it.
 
-1. **`rotational` flag** (`/sys/block/<dev>/queue/rotational`): 0 = NAND, 1 = platter
-2. **Device name prefix**: `nvme` = NVMe, `sd`/`vd` = SSD/HDD, `md` = RAID
-
-Decision matrix:
-
-| rotational | device prefix | speed class | default weight |
+| rotational | device prefix | speed class | weight |
 |---|---|---|---|
+| 1 | any | `hdd` | 1 |
 | 0 | `nvme` | `nvme` | 10 |
-| 0 | `sd`/`vd`/`dm` | `ssd` | 4 |
-| 1 | `sd`/`vd`/`dm` | `hdd` | 1 |
-| 0/1 | `md`/`dm` (RAID) | `hdd` (conservative) | 1 |
+| 0 | anything else | `ssd` | 4 |
+| any | `md` | `hdd` | 1 |
 
-Weight defaults are overridable by the user. Live speed weights are computed
-from `bytes_read / iowait_sec` per branch during observation.
+Weights are fixed defaults (`SPEED_WEIGHTS` in `model.py`). A branch whose
+device cannot be resolved stays `hdd`, which under-claims rather than
+promising speed it cannot prove.
 
 ### 4.4 Branch short labels
 

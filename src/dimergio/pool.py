@@ -5,7 +5,7 @@ import re
 import sys
 from pathlib import Path
 
-from .model import Branch, Pool
+from .model import SPEED_WEIGHTS, Branch, Pool, speed_class_for
 from .state import StateManager
 
 # (source, mountpoint, subvol option) — one entry per mounted filesystem.
@@ -56,48 +56,64 @@ def _mount_source(path: Path, mounts: list[Mount]) -> str | None:
 
 
 def _resolve_device(branch_path: Path, mounts: list[Mount]) -> str | None:
-    """Map a branch path to its dm-X device name."""
+    """Map a branch path to the kernel device name backing it."""
     source = _mount_source(branch_path, mounts)
-    return _dm_name(source) if source else None
+    return _device_name(source) if source else None
 
 
-def _dm_name(device_path: str) -> str | None:
-    """Convert /dev/dm-7 or /dev/mapper/foo to 'dm-7'."""
-    if device_path.startswith("/dev/dm-"):
-        return device_path.removeprefix("/dev/")
-    if device_path.startswith("/dev/mapper/"):
+def _device_name(device_path: str, dev_root: Path = Path("/dev")) -> str | None:
+    """Kernel device name for a mount source.
+
+    /dev/nvme0n1p1 -> nvme0n1p1, /dev/dm-7 -> dm-7, and a device-mapper or
+    by-uuid symlink resolves to whatever it points at.
+    """
+    if not _is_under(Path(device_path), dev_root):
+        return None
+    try:
+        resolved = Path(device_path).resolve()
+    except OSError:
+        resolved = Path(device_path)
+    return resolved.name or None
+
+
+def _rotational(device: str, sys: Path = Path("/sys")) -> bool:
+    """Whether the device spins. Partitions keep their queue on the parent disk."""
+    queue = sys / "block" / device / "queue" / "rotational"
+    if not queue.exists():
         try:
-            target = os.readlink(device_path)
-            name = Path(target).name
-            if name.startswith("dm-"):
-                return name
+            parent = (sys / "class" / "block" / device).resolve().parent.name
         except OSError:
-            pass
-    return None
+            parent = ""
+        if parent and parent != "block":
+            queue = sys / "block" / parent / "queue" / "rotational"
+    try:
+        return queue.read_text().strip() == "1"
+    except OSError:
+        return True
 
 
 def branch_devices(branch_path: Path, mounts: list[Mount]) -> list[str]:
-    """Every dm-X device backing the filesystem mounted at branch_path.
+    """Every device backing the filesystem mounted at branch_path.
 
     A branch on a multi-device btrfs pool reports all its member devices; any
     other mount reports the single device, or [] when it cannot be resolved.
     """
     source = _mount_source(branch_path, mounts)
-    dm_name = _dm_name(source) if source else None
-    if dm_name is None:
+    device = _device_name(source) if source else None
+    if device is None:
         return []
 
     try:
         fsid_dirs = list(Path("/sys/fs/btrfs").iterdir())
     except OSError:
-        return [dm_name]
+        return [device]
     for fsid_dir in fsid_dirs:
         devices_dir = fsid_dir / "devices"
         if not devices_dir.is_dir():
             continue
-        if (devices_dir / dm_name).exists():
+        if (devices_dir / device).exists():
             return sorted(d.name for d in devices_dir.iterdir() if d.is_dir())
-    return [dm_name]
+    return [device]
 
 
 def io_domains(branches: list[Branch], mounts: list[Mount]) -> tuple[list[list[str]], list[int]]:
@@ -292,11 +308,8 @@ def discover_pools() -> list[Pool]:
             if not bp.exists():
                 continue
             dev = _resolve_device(bp, mounts)
-            rotational = True
-            if dev:
-                rot_path = Path(f"/sys/block/{dev}/queue/rotational")
-                if rot_path.exists():
-                    rotational = rot_path.read_text().strip() == "1"
+            rotational = _rotational(dev) if dev else True
+            speed_class = speed_class_for(dev or "", rotational)
 
             try:
                 sv = os.statvfs(bp)
@@ -312,6 +325,8 @@ def discover_pools() -> list[Pool]:
                 rotational=rotational,
                 total_bytes=total,
                 free_bytes=free,
+                speed_class=speed_class,
+                speed_weight=SPEED_WEIGHTS[speed_class],
             ))
 
         if branches:

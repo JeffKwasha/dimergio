@@ -18,7 +18,6 @@ def speed_color(speed_class: str) -> str:
     return SPEED_COLORS.get(speed_class, "white")
 
 
-
 def effective_size_bytes(sz: int) -> int:
     """Physical cost floor for comparison: file size rounded up to the SSD
     block size, with a minimum of one block."""
@@ -35,11 +34,28 @@ def fmt_bytes(b: int) -> str:
     return f"{b}B"
 
 
+# Relative throughput per tier, used for savings projection and move ordering.
+SPEED_WEIGHTS = {"nvme": 10, "ssd": 4, "hdd": 1}
+
+
+def speed_class_for(device: str, rotational: bool) -> str:
+    """Tier for a branch's backing device.
+
+    The rotational flag is the trustworthy signal. Device names only separate
+    NVMe from other flash, since both report rotational=0. md arrays stay
+    conservative: the flag describes the array, not the disks under it.
+    """
+    if device.startswith("md"):
+        return "hdd"
+    if rotational:
+        return "hdd"
+    return "nvme" if device.startswith("nvme") else "ssd"
+
 
 @dataclass(slots=True, unsafe_hash=True)
 class Branch:
     path: Path
-    device: str           # e.g. "dm-3"
+    device: str           # kernel device name, e.g. "dm-3" or "nvme0n1p1"
     rotational: bool      # True = HDD, False = SSD/NVMe
     total_bytes: int = 0
     free_bytes: int = 0
@@ -58,10 +74,6 @@ class Branch:
                 name = name[:-len(suffix)]
                 break
         return name if name else self.path.name
-
-    @property
-    def device_stat_path(self) -> Path:
-        return Path(f"/sys/block/{self.device}/stat")
 
 
 @dataclass(slots=True)

@@ -14,14 +14,6 @@ class TestBranch:
         b = Branch(path=Path("/mnt/ssd"), device="dm-7", rotational=False)
         assert b.label == "ssd"
 
-    def test_device_stat_path(self):
-        b = Branch(path=Path("/mnt/ssd"), device="dm-7", rotational=False)
-        assert b.device_stat_path == Path("/sys/block/dm-7/stat")
-
-    def test_device_stat_path_empty(self):
-        b = Branch(path=Path("/mnt/slow"), device="", rotational=True)
-        assert b.device_stat_path == Path("/sys/block//stat")
-
 
 class TestPool:
     def test_fastest_branch_prefers_non_rotational(self):
