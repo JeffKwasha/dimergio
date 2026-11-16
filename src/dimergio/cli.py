@@ -180,7 +180,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 def cmd_cleanup(args: argparse.Namespace) -> None:
     ctx = PoolContext(args.pool)
     state = ctx.state
-    days = args.days if args.days is not None else 7
+    days = args.days if args.days is not None else load_config().get("cleanup_days", 7)
     entries = state.unverified(older_than_days=days)
 
     if not entries:

@@ -3,8 +3,8 @@
 ## 1. Overview
 
 dimergio watches a program's file reads through a mergerfs pool,
-identifies files that contribute most to I/O wait, and migrates them to the
-fastest branch in the pool. Reads are observed via fatrace; I/O device
+identifies files that contribute most to I/O wait, and migrates the ones you
+mark to the branch you pick. Reads are observed via fatrace; I/O device
 contention is correlated via kernel block-device stats. No write-based
 benchmarking is performed. No assumptions are made about hardware latency.
 
@@ -41,8 +41,8 @@ benchmarking is performed. No assumptions are made about hardware latency.
          ├── model.py         Data classes (Pool, Branch, ReadEvent, FileAccumulator,
          │                    PidStat, Candidate, MovePlan, MoveEntry) and byte formatting
          ├── mover.py         Copy, verify, rename, execute_move_plan()
-         ├── state.py         StateManager (MoveEntry tracking, checkpoints)
-         ├── stats.py         YAML persistence (.dimergio.yaml on largest branch)
+         ├── state.py         StateManager (MoveEntry tracking)
+         ├── stats.py         YAML persistence of per-file stats under state_dir
          └── config.py        User configuration
 ```
 
@@ -158,7 +158,7 @@ consistent file tracking across branches that use different mount layouts.
 |---|---|
 | `-f RW` | Read and write events (write tracking for move eligibility) |
 | `-u` | Include `[uid:gid]` for user filtering |
-| `-t -t` | Epoch-seconds timestamp prefix (the parser expects `TS PROC(PID) [UID:GID]:` ) |
+| `-t -t` | Epoch-seconds timestamp prefix. One `-t` prints `HH:MM:SS.micro`, two print seconds since the epoch, which is what the parser reads. |
 
 There is no per-PID filter on the fatrace command. Scope comes from the UID
 filter plus the tracked-path rule, and `--pid` / `--process` only decide when to
@@ -669,11 +669,14 @@ to verify & delete the originals.
 
 ### 9.1 State directory
 
+`config.state_dir`, default `$XDG_STATE_HOME/dimergio` (usually
+`~/.local/state/dimergio`). It holds the state file, the per-pool stats YAML,
+and nothing else.
+
 ```
-~/.local/share/dimergio/
-├── config.json
+~/.local/state/dimergio/
 ├── state.pool.json
-└── checkpoint.pool.json    # crash recovery checkpoint
+└── POOL.yaml        # accumulated stats, written on clean exit
 ```
 
 ### 9.2 State file format
@@ -703,11 +706,12 @@ to verify & delete the originals.
 - `true` = user confirmed program works
 - `false` = user reported problem (trigger undo)
 
-### 9.3 Checkpoint format
+### 9.3 Crash behavior
 
-Same schema but written during collection (every 60s). The checkpoint saves
-the accumulator state to survive crashes. On restart, the checkpoint is
-loaded and new data is merged.
+There is no crash checkpoint. Accumulated stats reach disk when the session
+ends cleanly (the TUI quits, or a passive run finishes), so a kill or a crash
+loses that session's observations. Use the same pool and `--data` path on the
+next run to keep collecting.
 
 ### 9.4 Undo
 
@@ -792,10 +796,9 @@ Undo migrations. Without `--all`, shows a numbered list and lets you pick.
 ```json
 {
   "prefix": "_dimergio_",
-  "state_dir": "~/.local/share/dimergio",
+  "state_dir": "~/.local/state/dimergio",
   "cleanup_days": 14,
   "default_pool": "/mnt/games",
-  "checkpoint_interval_s": 60,
   "iowait_interval_ms": 10,
   "symlink_depth": 3
 }
@@ -818,7 +821,7 @@ user actually opens. `0` disables the walk, which also disables symlink naming.
 - `Rich` for TUI: `Live`, `Table`, `Panel`, `Console`, `Prompt`, `Confirm`
 - `threading.Thread(daemon=True)` for keyboard reader and iowait sampler
 - `termios`/`tty` for raw keyboard input (isolated from Rich I/O)
-- `pyyaml` for stats persistence (`.dimergio.yaml` on largest branch)
+- `pyyaml` for stats persistence (`<POOL>.yaml` under `state_dir`)
 
 ## 13. Non-goals
 

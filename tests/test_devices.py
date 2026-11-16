@@ -76,3 +76,22 @@ def test_every_speed_class_has_a_weight():
     for tier in ("nvme", "ssd", "hdd"):
         assert SPEED_WEIGHTS[tier] >= 1
     assert SPEED_WEIGHTS["nvme"] > SPEED_WEIGHTS["ssd"] > SPEED_WEIGHTS["hdd"]
+
+
+def test_state_dir_default_is_xdg_state():
+    from dimergio.config import DEFAULT_STATE_DIR, DEFAULTS
+
+    assert DEFAULTS["state_dir"] == str(DEFAULT_STATE_DIR)
+    assert DEFAULT_STATE_DIR.name == "dimergio"
+    assert DEFAULT_STATE_DIR.parent.name == "state"
+
+
+def test_stats_follow_the_configured_state_dir(tmp_path, monkeypatch):
+    from dimergio import config, stats
+    from dimergio.model import Pool
+
+    monkeypatch.setattr(config, "load", lambda: {"state_dir": str(tmp_path / "state")})
+    monkeypatch.setattr(stats, "load_config", lambda: {"state_dir": str(tmp_path / "state")})
+
+    pool = Pool(mount=tmp_path / "pool", name="GAMMAS")
+    assert stats._stats_path(pool) == tmp_path / "state" / "GAMMAS.yaml"

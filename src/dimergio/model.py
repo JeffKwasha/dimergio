@@ -82,15 +82,6 @@ class Pool:
     name: str             # fsname from mount options (e.g. "GAMMAS")
     branches: list[Branch] = field(default_factory=list)
 
-    @property
-    def fastest_branch(self) -> Branch | None:
-        ssd = [b for b in self.branches if not b.rotational]
-        if ssd:
-            return max(ssd, key=lambda b: b.free_bytes)
-        if self.branches:
-            return max(self.branches, key=lambda b: b.free_bytes)
-        return None
-
 
 @dataclass(slots=True)
 class ReadEvent:

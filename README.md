@@ -142,8 +142,8 @@ confirm each one. Use `-a` to skip prompting or `-d` to change the day filter
 dimergio undo --pool /mnt/pool
 ```
 
-Stats are saved to `.dimergio.yaml` on the largest branch root when the TUI exits.
-They persist across sessions and track read/write counts and iowait per file.
+Stats are saved to `state_dir` when the TUI exits. They persist across sessions
+and track read/write counts and iowait per file.
 
 ## Commands
 
@@ -227,10 +227,9 @@ defaults:
 ```json
 {
   "prefix": "_dimergio_",
-  "state_dir": "~/.local/share/dimergio",
+  "state_dir": "~/.local/state/dimergio",
   "cleanup_days": 14,
   "default_pool": "/mnt/games",
-  "checkpoint_interval_s": 60,
   "iowait_interval_ms": 10,
   "symlink_depth": 3
 }
@@ -239,24 +238,23 @@ defaults:
 | Key | Default | Description |
 |---|---|---|
 | `prefix` | `_dimergio_` | Prefix for renamed originals on the slow branch |
-| `state_dir` | `~/.local/share/dimergio` | Where state and checkpoint files live |
-| `cleanup_days` | `14` | Age threshold (days) for `dimergio cleanup` |
+| `state_dir` | `$XDG_STATE_HOME/dimergio` | Where the state file and the per-pool stats YAML live |
+| `cleanup_days` | `14` | Default age threshold for `dimergio cleanup`; `-d` overrides it |
 | `default_pool` | `/mnt/games` | Pool used when `--pool` is omitted |
-| `checkpoint_interval_s` | `60` | Accumulator snapshot interval during collection |
 | `iowait_interval_ms` | `10` | Initial iowait sampling interval (`--iowait-interval` overrides) |
 | `symlink_depth` | `3` | Directory depth walked at startup to label files by symlink name; `0` disables the walk |
 
 Missing keys are filled from defaults — you only need to list overrides.
 
-## State & Crash Recovery
+## State & Persistence
 
-- **State file:** `~/.local/share/dimergio/state.<pool>.json` — list of
-  every migration with source, target, timestamps, and verification status
-- **Checkpoint:** `~/.local/share/dimergio/checkpoint.<pool>.json` —
-  accumulator snapshot written every 60 s during collection. If dimergio
-  crashes mid-session, the checkpoint is loaded on restart and new data
-  is merged transparently.
-- Both files use atomic writes (write to `.tmp`, then `rename`).
+- **State file:** `state.<pool>.json` under `state_dir`, a list of every
+  migration with source, target, timestamps, and verification status.
+- **Stats:** `<POOL>.yaml` under `state_dir`, written when a session ends
+  cleanly and merged into the next session on load.
+- Both use atomic writes (write to `.tmp`, then `rename`).
+- A crash loses the current session's observations. Nothing is replayed from a
+  partial write.
 
 ## Safety
 
@@ -346,7 +344,7 @@ BROWSE mode ────────────────────── B
   selected automatically.
 - **IO domain** — branches backed by the same block devices; their busy
   time is summed, so two branches on one btrfs pool cannot look independent.
-- **Stats persistence** — `.dimergio.yaml` on largest branch root, additive merge across sessions.
+- **Stats persistence** — `<POOL>.yaml` under `state_dir`, additive merge across sessions.
 
 ## Why not...
 

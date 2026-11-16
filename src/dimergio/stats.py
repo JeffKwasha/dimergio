@@ -1,21 +1,19 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
 import yaml
 
+from .config import load as load_config
 from .model import FileAccumulator, Pool
 
 logger = logging.getLogger(__name__)
 
-_STATS_FILENAME = ".dimergio.yaml"
-
 
 def _stats_path(pool: Pool) -> Path:
-    state_root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-    return state_root / "dimergio" / f"{pool.name}.yaml"
+    state_dir = Path(load_config()["state_dir"]).expanduser()
+    return state_dir / f"{pool.name}.yaml"
 
 
 def load_stats(pool: Pool) -> dict[str, dict]:

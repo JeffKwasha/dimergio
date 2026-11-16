@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 
 CONFIG_DIR = Path.home() / ".config" / "dimergio"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+# State files and the per-pool stats YAML live under state_dir.
+DEFAULT_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "dimergio"
+
 DEFAULTS = dict(
     prefix="_dimergio_",
-    state_dir=str(Path.home() / ".local" / "share" / "dimergio"),
+    state_dir=str(DEFAULT_STATE_DIR),
     cleanup_days=14,
     default_pool="/mnt/games",
-    checkpoint_interval_s=60,
     iowait_interval_ms=10,
     # Depth (from the data path / pwd) to walk for symlinks when building the
     # display-name map. 0 disables symlink-name resolution entirely.

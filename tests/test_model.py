@@ -4,7 +4,6 @@ from dimergio.model import (
     Branch,
     FileAccumulator,
     MoveEntry,
-    Pool,
     ReadEvent,
 )
 
@@ -13,30 +12,6 @@ class TestBranch:
     def test_label(self):
         b = Branch(path=Path("/mnt/ssd"), device="dm-7", rotational=False)
         assert b.label == "ssd"
-
-
-class TestPool:
-    def test_fastest_branch_prefers_non_rotational(self):
-        hdd = Branch(path=Path("/hdd"), device="dm-0", rotational=True, free_bytes=100)
-        ssd = Branch(path=Path("/ssd"), device="dm-1", rotational=False, free_bytes=50)
-        pool = Pool(mount=Path("/pool"), name="POOL", branches=[hdd, ssd])
-        assert pool.fastest_branch == ssd
-
-    def test_fastest_branch_picks_largest_ssd(self):
-        small = Branch(path=Path("/small"), device="dm-0", rotational=False, free_bytes=50)
-        large = Branch(path=Path("/large"), device="dm-1", rotational=False, free_bytes=200)
-        pool = Pool(mount=Path("/pool"), name="POOL", branches=[small, large])
-        assert pool.fastest_branch == large
-
-    def test_fastest_branch_falls_back_to_hdd(self):
-        h1 = Branch(path=Path("/h1"), device="dm-0", rotational=True, free_bytes=100)
-        h2 = Branch(path=Path("/h2"), device="dm-1", rotational=True, free_bytes=300)
-        pool = Pool(mount=Path("/pool"), name="POOL", branches=[h1, h2])
-        assert pool.fastest_branch == h2
-
-    def test_fastest_branch_no_branches(self):
-        pool = Pool(mount=Path("/pool"), name="POOL")
-        assert pool.fastest_branch is None
 
 
 class TestFileAccumulator:
