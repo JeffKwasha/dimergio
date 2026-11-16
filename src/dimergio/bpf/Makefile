@@ -18,7 +18,7 @@ BPFTOOL ?= bpftool
 CC ?= cc
 PKG_CONFIG ?= pkg-config
 
-BINDIR ?= ../bin
+PREFIX ?= /usr/local
 VMLINUX ?= /sys/kernel/btf/vmlinux
 
 ARCH := $(shell uname -m)
@@ -42,7 +42,7 @@ endif
 
 .PHONY: all clean install
 
-all: $(BINDIR)/dimergio-mmap
+all: dimergio-mmap
 
 vmlinux.h: $(VMLINUX)
 	$(BPFTOOL) btf dump file $(VMLINUX) format c > $@
@@ -60,7 +60,7 @@ $(BINDIR)/dimergio-mmap: mmap_tracer
 	mkdir -p $(BINDIR)
 	cp mmap_tracer $@
 
-install: $(BINDIR)/dimergio-mmap
+install: dimergio-mmap
 
 clean:
-	rm -f mmap_tracer mmap_tracer.bpf.o mmap_tracer.skel.h vmlinux.h
+	rm -f mmap_tracer dimergio-mmap mmap_tracer.bpf.o mmap_tracer.skel.h vmlinux.h

@@ -5,8 +5,10 @@ __pycache__/
 *.swp
 *.swo
 
-# eBPF build artifacts (the committed binary lives in src/dimergio/bin/)
+# eBPF build artifacts. The tracer is built from source and installed on PATH.
 src/dimergio/bpf/vmlinux.h
 src/dimergio/bpf/*.bpf.o
 src/dimergio/bpf/*.skel.h
 src/dimergio/bpf/mmap_tracer
+src/dimergio/bpf/dimergio-mmap
+src/dimergio/bin/
