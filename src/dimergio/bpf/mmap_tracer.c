@@ -57,9 +57,12 @@ static void clear_pid(struct mmap_tracer_bpf *skel, __u32 pid)
     struct fault_key key, next;
     int err = bpf_map__get_next_key(map, NULL, &key, sizeof(key));
     while (err == 0) {
+        /* Fetch the successor before deleting: libbpf returns the first key
+         * when asked for the successor of a key that no longer exists, which
+         * would restart the scan while the kprobe recreates entries. */
+        err = bpf_map__get_next_key(map, &key, &next, sizeof(next));
         if (key.pid == pid)
             bpf_map__delete_elem(map, &key, sizeof(key), 0);
-        err = bpf_map__get_next_key(map, &key, &next, sizeof(key));
         key = next;
     }
 }
