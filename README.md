@@ -35,12 +35,23 @@ from actual observation.
 - `fatrace` — file access tracing (full paths, UID filtering)
 - `mergerfs` — FUSE pool with at least two branches
 - Python **≥3.10** with `rich` library
+- `clang` + `bpftool` — only to build the optional mmap tracer
 
 ## Install
 
 ```bash
 uv pip install -e .
 ```
+
+The optional mmap tracer is built from source and installed on `PATH`. Skip it
+if you only need fatrace reads; dimergio runs without it.
+
+```bash
+make -C src/dimergio/bpf
+sudo make -C src/dimergio/bpf install
+```
+
+Set `DIMERGIO_MMAP_BIN` to use a tracer that is somewhere else on disk.
 
 ## Workflow
 
@@ -50,9 +61,9 @@ uv pip install -e .
 dimergio watch --pool /mnt/pool --data /mnt/pool/Data --pid 12345 --sudo
 ```
 
-dimergio spawns `fatrace -f RW -u -t -p <pid>`, samples `io_ticks` from
-`/sys/block/*/stat` at 100Hz, and merges each read/write event
-with the device busy% at that moment.
+dimergio spawns `fatrace -f RW -u -t -t`, samples `io_ticks` from
+`/proc/diskstats` at 100Hz, and charges each read event its share of the
+device-busy time from the previous sampling window.
 
 The Rich TUI shows live process stats, file table, and tier summary on a
 single BROWSE screen. Observation and selection happen together — sampling
@@ -70,23 +81,23 @@ the PREVIEW panel (or `q` to quit).
 - Press `↑` / `↓` to highlight a file (cursor)
 - Press `←` / `→` to rotate the sort column (IOW/MB → IOWAIT → READS; the active column is highlighted)
 - Press `Space` to rotate the highlighted file's target branch forward
-- Press `0-9` to mark a file's target branch (color-coded by speed class)
-- Press `Shift+0-9` to mark all files above (higher iowait)
+- Press `Tab` (or `Home` / `End`) to switch focus between the file list and the process list
 - Press `-` to clear a mark, `c` to clear session stats
 - Press `Enter` to preview the moves (ordered, color-coded by branch)
 - Press `q` twice within 4s to quit (first press shows a warning; any other key cancels)
-- Press `[` / `]` to slow down / speed up the iowait sampling rate (5ms steps)
+- Press `[` / `]` to speed up / slow down the iowait sampling rate (5ms steps)
 
 **Watching mmap readers.** Programs that load files with `mmap` (llama.cpp
 model loaders, many emulators, data loaders) never show up in fatrace — the
 kernel's fanotify API does not report mmap accesses. dimergio detects them
-with a small eBPF tracer (`src/dimergio/bin/dimergio-mmap`, a CO-RE
-`filemap_fault` kprobe that counts page faults per PID/inode). Press `m` to
-scan for candidate PIDs, then `Home` to focus the process list. `Enter` on a
-process toggles watching its mmap faults; watched faults are folded into the
-same per-file iowait/read ranking as fatrace reads. `End` returns focus to the
-file list. Without the tracer (or without root), mmap detection degrades to a
-no-op and `m` shows a notice.
+with a small eBPF tracer (`dimergio-mmap`, a CO-RE `filemap_fault` kprobe that
+counts page faults per PID/inode). Press `m` to scan for candidate PIDs; the
+scan also moves focus to the process list. `Enter` on a process toggles
+watching its mmap faults; watched faults are folded into the same per-file
+iowait/read ranking as fatrace reads. `Tab` or `End` returns focus to the file
+list. You can start a PID under watch directly with `--mmap-pid N` (repeatable).
+Without the tracer, mmap detection degrades to a no-op: `m` still lists
+candidates and `Enter` reports why it cannot watch them.
 
 Files are ranked by **iowait cost per MB** (byte-weighted: file size rounded
 up to the 128 KiB SSD block floor), so large slow files outrank tiny ones with
@@ -96,10 +107,11 @@ On `Enter` a **PREVIEW** panel lists every planned move, ordered by iowait
 debt and color-coded by destination branch, with the total bytes to copy.
 `Enter` applies the moves; `Esc` returns to BROWSE; `q` (twice) quits without applying.
 
-**3. Migrate** — files are copied to the target branch, verified (size), and
-the originals are renamed with a `_dimergio_` prefix. mergerfs now sees
-only the fast-branch copy. Smart rename: if file already on target branch,
-just swaps prefix (no copy needed).
+**3. Migrate** — the source is resolved to the real file (a symlink is never
+moved, and a path recorded through one is remapped to the file's branch),
+copied to the target branch, verified by size, and the original is renamed
+with a `_dimergio_` prefix. mergerfs now sees only the fast-branch copy.
+Every move copies, so the reported byte total is what lands on the target.
 
 After the operations complete, a color-coded operations list and the total
 bytes copied (MB, or GB if over 10GB) are shown. The redundant renamed
@@ -139,8 +151,7 @@ They persist across sessions and track read/write counts and iowait per file.
 dimergio <command> [options]
 
 Commands:
-  watch      Run fatrace, collect, analyze, and select files to move
-  analyze    Analyze existing fatrace log
+  watch      Run fatrace, collect, analyze, and move files
   status     Show migration state
   cleanup    Verify old migrations and clean up originals
   undo       Undo migrations
@@ -158,6 +169,9 @@ Commands:
 | `--iowait-interval N` | 10 | I/O wait sampling interval in ms |
 | `--verify` | — | SHA256-verify each file after copy |
 | `--no-interactive` | — | Headless mode (no TUI) |
+| `--mmap-pid N` | — | Watch mmap page-fault reads of PID N (repeatable) |
+| `--offline` | — | Skip collection and analyze saved stats or a log |
+| `--from-log PATH` | — | Replay a captured fatrace log (with `--offline`) |
 | `--verbose`, `-v` | — | Log raw fatrace lines to stderr |
 | `--version` | — | Show version and exit |
 
@@ -172,10 +186,10 @@ line-by-line in a dedicated thread.
 
 ### I/O wait sampling
 
-`io_ticks` (field 9 in `/sys/block/*/stat`) is sampled at 100Hz (10ms) by
-default. The sample interval is adjustable at runtime via `[` and `]` keys
-(5ms increments, minimum 5ms = 200Hz max). Each sample reads one file per
-branch device — cost is ~microseconds.
+`io_ticks` is read from `/proc/diskstats` at 100Hz (10ms) by default. The
+sample interval is adjustable at runtime via `[` and `]` keys (5ms increments,
+minimum 5ms = 200Hz max). Each sample is one read of `/proc/diskstats` for all
+devices, and devices backing the same branch set are summed into one IO domain.
 
 ### Memory
 
@@ -214,8 +228,11 @@ defaults:
 {
   "prefix": "_dimergio_",
   "state_dir": "~/.local/share/dimergio",
-  "cleanup_days": 7,
-  "default_pool": "/mnt/games"
+  "cleanup_days": 14,
+  "default_pool": "/mnt/games",
+  "checkpoint_interval_s": 60,
+  "iowait_interval_ms": 10,
+  "symlink_depth": 3
 }
 ```
 
@@ -225,6 +242,9 @@ defaults:
 | `state_dir` | `~/.local/share/dimergio` | Where state and checkpoint files live |
 | `cleanup_days` | `14` | Age threshold (days) for `dimergio cleanup` |
 | `default_pool` | `/mnt/games` | Pool used when `--pool` is omitted |
+| `checkpoint_interval_s` | `60` | Accumulator snapshot interval during collection |
+| `iowait_interval_ms` | `10` | Initial iowait sampling interval (`--iowait-interval` overrides) |
+| `symlink_depth` | `3` | Directory depth walked at startup to label files by symlink name; `0` disables the walk |
 
 Missing keys are filled from defaults — you only need to list overrides.
 
@@ -271,8 +291,14 @@ the rotational flag and device name prefix. Short labels are derived
 from the last path component with common suffixes stripped.
 
 Fatrace runs against raw btrfs volume mounts (not FUSE), and paths
-are remapped to pool-relative via the volume map. This handles
-symlinks, bind mounts, and mergerfs mount aliases transparently.
+are remapped to pool-relative via the volume map. One resolver in
+`pool.py` does this for the live TUI and for `--from-log`, so both track the
+same files. Symlinks are resolved to the real file, and a file is tracked when
+it lives under the data path or is reachable through a symlink there.
+
+Branches that share a set of block devices (one btrfs pool) also share an
+**IO domain**: their `io_ticks` are summed before the per-event share is
+computed, because they contend for the same device queue.
 
 ## Architecture
 
@@ -283,7 +309,7 @@ fatrace -f RW -u -t -p <pid>
 collector._parse_line()          ─── ReadEvent (timestamp, proc, pid, uid, event, path)
     │                                PidStat (process_name from /proc/<pid>/comm)
     │
-    ├── collector._sample_iowait() ─── iowait_sec (delta, fairness-weighted)
+    ├── collector.IOWaitSampler    ─── iowait_sec (domain busy time / events)
     │
     ├── collector._accumulate()    ─── FileAccumulator.total_reads++  (R events)
     │                                  FileAccumulator.write_count++   (W events)
@@ -299,10 +325,11 @@ collector._parse_line()          ─── ReadEvent (timestamp, proc, pid, uid,
 
 BROWSE mode ────────────────────── Branch marking + file selection
     │
-    ├── ↑/↓ ────── Highlight file (cursor)
+    ├── ↑/↓ ────── Highlight row in the focused list
+    ├── ←/→ ────── Re-sort the focused list
+    ├── Tab ────── Switch focus (files ↔ processes)
     ├── Space ─── Rotate highlighted file's target branch
-    ├── 0-9 ────── Mark target branch (color-coded)
-    ├── Shift+0-9  Mark above (skip writes)
+    ├── m ─────── Scan mmap candidates, focus processes
     ├── Enter ──── Preview → confirm → execute_move_plan()
     └── q ──────── Quit (press twice within 4s)
 ```
@@ -313,11 +340,12 @@ BROWSE mode ────────────────────── B
   Higher = more I/O impact. Default ranking metric.
 - **Speed class** — auto-detected tier: `nvme`, `ssd`, or `hdd`.
 - **Speed weight** — relative throughput: nvme=10, ssd=4, hdd=1.
-- **Target distribution** — ideal iowait split: weight[i] / sum(weights).
-- **Gap** — target - actual per branch. Positive = spare capacity.
-- **Multi-tier moves** — files move from overloaded branches to branches with
-  positive gap, proportional to their capacity.
-- **Smart rename** — if file already on target branch, just swap prefix (no copy).
+- **Effective size** — file size rounded up to the 128 KiB SSD block floor;
+  the denominator of the iowait-per-MB ranking.
+- **Selection is manual** — you mark which files move where; nothing is
+  selected automatically.
+- **IO domain** — branches backed by the same block devices; their busy
+  time is summed, so two branches on one btrfs pool cannot look independent.
 - **Stats persistence** — `.dimergio.yaml` on largest branch root, additive merge across sessions.
 
 ## Why not...
