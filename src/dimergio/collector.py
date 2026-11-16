@@ -369,16 +369,15 @@ class Collector:
 
     def _build_fatrace_cmd(self) -> list[str]:
         """Construct the fatrace command line (single source of truth)."""
-        _FATRACE = "/usr/sbin/fatrace"
-        cmd = [_FATRACE, "-f", "RW", "-u", "-t", "-t"]
+        fatrace = shutil.which("fatrace") or "/usr/sbin/fatrace"
+        cmd = [fatrace, "-f", "RW", "-u", "-t", "-t"]
         if self.use_sudo and os.geteuid() != 0:
             import getpass
 
             user = getpass.getuser()
-            fatrace_path = shutil.which("fatrace") or _FATRACE
             print("\nTip: run this once to skip the password prompt:")
             print(
-                f"  echo '{user} ALL=(root) NOPASSWD: {fatrace_path}' | "
+                f"  echo '{user} ALL=(root) NOPASSWD: {fatrace}' | "
                 f"sudo tee /etc/sudoers.d/dimergio && sudo chmod 0440 /etc/sudoers.d/dimergio\n"
             )
             cmd = ["sudo"] + cmd
