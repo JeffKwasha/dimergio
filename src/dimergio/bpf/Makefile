@@ -14,7 +14,7 @@
 #   make CFLAGS="... -static" LIBS="-L... -lbpf -lelf -lz -lpthread"
 
 CLANG ?= clang
-BPFTOOL ?= bpftool
+BPFTOOL ?= $(shell command -v bpftool 2>/dev/null || echo /usr/sbin/bpftool)
 CC ?= cc
 PKG_CONFIG ?= pkg-config
 
@@ -53,14 +53,12 @@ mmap_tracer.bpf.o: mmap_tracer.bpf.c vmlinux.h
 mmap_tracer.skel.h: mmap_tracer.bpf.o
 	$(BPFTOOL) gen skeleton mmap_tracer.bpf.o > $@
 
-mmap_tracer: mmap_tracer.c mmap_tracer.skel.h
+dimergio-mmap: mmap_tracer.c mmap_tracer.skel.h
 	$(CC) $(CFLAGS) -o $@ mmap_tracer.c $(LIBS)
 
-$(BINDIR)/dimergio-mmap: mmap_tracer
-	mkdir -p $(BINDIR)
-	cp mmap_tracer $@
-
 install: dimergio-mmap
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -m 0755 dimergio-mmap $(DESTDIR)$(PREFIX)/bin/dimergio-mmap
 
 clean:
-	rm -f mmap_tracer dimergio-mmap mmap_tracer.bpf.o mmap_tracer.skel.h vmlinux.h
+	rm -f dimergio-mmap mmap_tracer mmap_tracer.bpf.o mmap_tracer.skel.h vmlinux.h
