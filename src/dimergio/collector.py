@@ -261,11 +261,18 @@ class Collector:
         self._symlink_map: dict[Path, str] = self._build_symlink_map()
         from .mmap import MmapWatcher
 
+        self._mmap_notice: str | None = None
+        self._mmap_unresolved = 0
         self._mmap_watcher = MmapWatcher(
             path_ok=lambda p: self._resolve_tracked_path(p) is not None,
             use_sudo=use_sudo,
             interval_ms=iowait_interval_ms,
+            on_failure=self._on_mmap_failure,
         )
+
+    def _on_mmap_failure(self, reason: str) -> None:
+        """A tracer the user asked for has stopped; the TUI shows it next frame."""
+        self._mmap_notice = f"mmap tracing failed: {reason}"
 
     def _build_symlink_map(self) -> dict[Path, str]:
         """One-time reverse map: real file → shortest symlink relpath (from pwd).
@@ -467,7 +474,9 @@ class Collector:
 
         for pid in self.mmap_pids:
             if not self._mmap_watcher.enable(pid, self._on_mmap):
-                logger.warning("mmap tracing for pid %d could not start (see earlier warning)", pid)
+                reason = self._mmap_watcher.last_error or "unknown reason"
+                logger.warning("mmap tracing for pid %d could not start: %s", pid, reason)
+                self._mmap_notice = f"mmap pid {pid}: {reason}"
 
         use_interactive = (
             not self.pid
@@ -683,6 +692,9 @@ class Collector:
         # ─── BROWSE layout (merged monitor + select) ─────────────────
         def _build_browse(now: float) -> Panel:
             nonlocal focus, proc_scroll, proc_selected, flash_msg, flash_at
+            if self._mmap_notice is not None:
+                _set_flash(self._mmap_notice)
+                self._mmap_notice = None
             _SORT_LABEL = {"reads": "READS", "iowait": "IOWAIT", "iowait_per_mb": "IOW/MB"}
             _PROC_SORT_LABEL = {"mmap": "MMAP", "reads": "READS", "iowait": "IOWAIT"}
             elapsed = _fmt_duration(now - start_time)
@@ -1054,7 +1066,8 @@ class Collector:
                 return False
             if key == KEYS.MMAP:
                 if not self._mmap_watcher.available:
-                    _set_flash("mmap tracer not available — build src/dimergio/bpf (make)")
+                    reason = self._mmap_watcher.last_error or "tracer not available"
+                    _set_flash(f"mmap: {reason}")
                     return False
                 self._mmap_watcher.scan()
                 _focus_procs()
@@ -1089,7 +1102,9 @@ class Collector:
                             if self._mmap_watcher.is_watching(pid):
                                 self._mmap_watcher.disable(pid)
                             elif not self._mmap_watcher.enable(pid, self._on_mmap):
-                                _set_flash("cannot start mmap tracer — run as root or build dimergio-mmap")
+                                reason = self._mmap_watcher.last_error or "unknown reason"
+                                logger.warning("mmap tracing for pid %d could not start: %s", pid, reason)
+                                _set_flash(f"mmap: {reason}")
                     return False
 
             # ── file focus ────────────────────────────────────────────
@@ -1359,6 +1374,7 @@ class Collector:
             return
         path = self._mmap_watcher.resolve_path(pid, ino)
         if path is None:
+            self._note_unresolved_mmap()
             return
         norm = self._resolve_tracked_path(path)
         if norm is None:
@@ -1381,6 +1397,18 @@ class Collector:
         acc = self._get_acc(norm, branch_idx, ts)
         acc.observe_n(ts, count)
         self._sampler.record_event(branch_idx, (norm, pid), count)
+
+    def _note_unresolved_mmap(self) -> None:
+        """Say so, once, when faults arrive that userspace cannot name."""
+        self._mmap_unresolved += 1
+        if self._mmap_unresolved != 1:
+            return
+        reason = (
+            "mmap faults seen but the mapped file could not be named: the fault "
+            "reports the backing inode, while a pool mapping shows a FUSE inode"
+        )
+        logger.warning("%s", reason)
+        self._mmap_notice = reason
 
     def _resolve_branch(self, path: Path) -> int | None:
         """Index of the branch holding ``path``, cached, or None when none does."""

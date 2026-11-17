@@ -31,7 +31,7 @@ from actual observation.
 
 ## Requirements
 
-- **Linux** (kernel 6.x)
+- **Linux** 6.1 or later (tested on 7.0)
 - `fatrace` — file access tracing (full paths, UID filtering)
 - `mergerfs` — FUSE pool with at least two branches
 - Python **≥3.10** with `rich` library
@@ -98,6 +98,13 @@ iowait/read ranking as fatrace reads. `Tab` or `End` returns focus to the file
 list. You can start a PID under watch directly with `--mmap-pid N` (repeatable).
 Without the tracer, mmap detection degrades to a no-op: `m` still lists
 candidates and `Enter` reports why it cannot watch them.
+
+One limit applies today. Faults are keyed by the inode the kernel faulted on.
+A file mapped through the mergerfs mount faults on the backing file, so the
+tracer reports the backing inode while the mapping in `/proc/<pid>/maps` shows
+a FUSE inode. Such faults cannot be named yet, so dimergio reports the mismatch
+once instead of counting them. Files mapped directly from a branch or through
+the btrfs volume do resolve and count.
 
 Files are ranked by **iowait cost per MB** (byte-weighted: file size rounded
 up to the 128 KiB SSD block floor), so large slow files outrank tiny ones with
@@ -280,6 +287,12 @@ sudo setcap cap_sys_admin,cap_dac_read_search+ep /usr/local/bin/fatrace
 turn an event handle back into a path through `open_by_handle_at`. With only
 the first, every event prints `(deleted)` and dimergio drops it, because the
 parser needs a path.
+
+The mmap tracer needs less: `sudo setcap cap_bpf,cap_perfmon+ep /usr/local/bin/dimergio-mmap`.
+`cap_sys_admin` is unnecessary on 6.1 and later. Keep both binaries at mode
+`0750` so the capability is not offered to every user on the machine, and
+re-apply the capability after any copy, `chown`, or rebuild: the kernel strips
+`security.capability` from a new inode by design.
 
 The tool checks for cached sudo credentials before starting the TUI.
 

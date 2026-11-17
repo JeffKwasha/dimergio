@@ -4,7 +4,10 @@
 
 dimergio watches a program's file reads through a mergerfs pool,
 identifies files that contribute most to I/O wait, and migrates the ones you
-mark to the branch you pick. Reads are observed via fatrace; I/O device
+mark to the branch you pick.
+
+Requirements: Linux 6.1 or later (tested on 7.0), Python 3.10 or later,
+`fatrace`, and `mergerfs`. Reads are observed via fatrace; I/O device
 contention is correlated via kernel block-device stats. No write-based
 benchmarking is performed. No assumptions are made about hardware latency.
 
@@ -492,6 +495,20 @@ sampler event counts, PID stats).
 The tracer is built from `src/dimergio/bpf` (C sources, Makefile) and installed
 on `PATH` as `dimergio-mmap`. `DIMERGIO_MMAP_BIN` overrides the lookup. Build
 products are not tracked in git.
+
+Privileges: the tracer needs `cap_bpf` and `cap_perfmon`, not `cap_sys_admin`
+(5.8 and later semantics). fatrace needs `cap_sys_admin` for `fanotify_init`
+and `cap_dac_read_search` for `open_by_handle_at`. Both binaries should be mode
+`0750` when they carry capabilities, and the capability must be re-applied
+after any copy, `chown`, or rebuild, because the kernel strips
+`security.capability` from a new inode.
+
+Resolution limit: a fault is keyed by the inode the kernel faulted on. A file
+mapped through the mergerfs mount faults on its backing file, so the tracer
+reports the backing inode while `/proc/<pid>/maps` shows a FUSE inode. Those
+faults cannot be named, and the collector reports the mismatch once (log and
+TUI notice) rather than dropping them silently. Files mapped from a branch or
+the btrfs volume resolve and count.
 
 - Press **`m`** to scan `/proc/<pid>/io` `read_bytes` for processes whose file
   mappings fall under the watched data path. Candidates are sorted by that

@@ -9,6 +9,7 @@ tracer subprocess protocol — without needing a real kernel.
 import io
 import os
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -297,3 +298,79 @@ def test_watcher_runs_the_tracer_and_reports_faults(tmp_path):
         w.stop()
 
     assert events and events[0] == (1234, 4242, 7)
+
+
+# ─── a tracer that dies must be reported with its reason ────────────
+def _script(tmp_path, name, body):
+    path = tmp_path / name
+    path.write_text("#!/usr/bin/env python3\n" + body)
+    path.chmod(0o755)
+    return path
+
+
+def test_tracer_death_is_reported_with_its_reason(tmp_path, caplog):
+    dying = _script(
+        tmp_path,
+        "dying-tracer",
+        "import sys\n"
+        "print('libbpf: failed to load BPF skeleton: -EPERM', file=sys.stderr, flush=True)\n"
+        "sys.exit(1)\n",
+    )
+    failures: list[str] = []
+    w = MmapWatcher(
+        path_ok=lambda p: True,
+        binary=str(dying),
+        on_failure=failures.append,
+    )
+    try:
+        assert w.enable(101, lambda *a: None)
+        for _ in range(200):
+            if failures:
+                break
+            time.sleep(0.01)
+    finally:
+        w.stop()
+
+    assert failures == ["libbpf: failed to load BPF skeleton: -EPERM"]
+    assert w.last_error == failures[0]
+    assert not w.watching()
+    assert any(
+        "mmap tracing failed" in r.message and "-EPERM" in r.message
+        for r in caplog.records
+        if r.levelname == "WARNING"
+    )
+
+
+def test_requested_stop_is_not_a_failure(tmp_path):
+    healthy = _script(
+        tmp_path,
+        "healthy-tracer",
+        "import sys\nimport time\n"
+        "for line in sys.stdin:\n"
+        "    pass\n",
+    )
+    failures: list[str] = []
+    w = MmapWatcher(path_ok=lambda p: True, binary=str(healthy), on_failure=failures.append)
+    assert w.enable(101, lambda *a: None)
+    w.stop()
+
+    assert failures == []
+
+
+def test_missing_tracer_says_how_to_build_it(monkeypatch):
+    monkeypatch.delenv("DIMERGIO_MMAP_BIN", raising=False)
+    monkeypatch.setattr(mm.shutil, "which", lambda name: None)
+    w = MmapWatcher(path_ok=lambda p: True)
+    assert w.enable(101, lambda *a: None) is False
+    assert "make -C src/dimergio/bpf" in (w.last_error or "")
+
+
+def test_root_refuses_a_writable_tracer(monkeypatch, tmp_path):
+    tracer = _script(tmp_path, "tracer", "import time\n")
+    tracer.chmod(0o777)
+    monkeypatch.setattr(mm.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("DIMERGIO_MMAP_BIN", str(tracer))
+    w = MmapWatcher(path_ok=lambda p: True)
+
+    assert w.enable(101, lambda *a: None) is False
+    assert "writable tracer" in (w.last_error or "")

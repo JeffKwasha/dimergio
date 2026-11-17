@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import logging
 import os
 import shutil
@@ -57,24 +58,50 @@ class MmapWatcher:
         use_sudo: bool = False,
         binary: str | None = None,
         interval_ms: int = 10,
+        on_failure: Callable[[str], None] | None = None,
     ) -> None:
         self._path_ok = path_ok
         self._use_sudo = use_sudo
+        self.last_error: str | None = None
         self._binary = binary or self._find_binary()
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._watching: set[int] = set()
         self._ino_cache: dict[int, dict[int, Path]] = {}
         self._candidates: list[MmapCandidate] = []
         self._on_event: Callable[[int, int, int], None] | None = None
+        self._on_failure = on_failure
+        self._stderr_tail: collections.deque[str] = collections.deque(maxlen=5)
         self._interval_ms = interval_ms
 
     def _find_binary(self) -> str | None:
+        """Locate the tracer, but never let an environment variable pick a
+        binary that root would then execute."""
         override = os.environ.get("DIMERGIO_MMAP_BIN")
-        if override:
-            return override if os.access(override, os.X_OK) else None
-        return shutil.which("dimergio-mmap")
+        candidate = override or shutil.which("dimergio-mmap")
+        if candidate is None:
+            self.last_error = (
+                "dimergio-mmap not found: build it with "
+                "`make -C src/dimergio/bpf && sudo make -C src/dimergio/bpf install`"
+            )
+            return None
+        if not os.access(candidate, os.X_OK):
+            self.last_error = f"dimergio-mmap is not executable: {candidate}"
+            return None
+        if os.geteuid() == 0:
+            try:
+                st = os.stat(candidate)
+            except OSError:
+                self.last_error = f"dimergio-mmap is unreadable: {candidate}"
+                return None
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                self.last_error = (
+                    f"refusing to run a writable tracer as root: {candidate}"
+                )
+                return None
+        return candidate
 
     @property
     def available(self) -> bool:
@@ -139,6 +166,8 @@ class MmapWatcher:
         """Start tracing ``pid``'s mmap page faults.  Returns False if the
         tracer binary is unavailable or failed to start."""
         if not self._binary:
+            if self.last_error is None:
+                self.last_error = "mmap tracer is not available"
             return False
         with self._lock:
             if pid in self._watching:
@@ -187,6 +216,7 @@ class MmapWatcher:
             # can never touch the user's tty.
             if subprocess.run(["sudo", "-n", "true"]).returncode != 0:
                 import getpass
+                self.last_error = "mmap tracer needs passwordless sudo"
                 logger.warning(
                     "mmap tracer needs passwordless sudo — run:\n"
                     "  echo '%s ALL=(root) NOPASSWD: %s' | "
@@ -201,18 +231,42 @@ class MmapWatcher:
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 start_new_session=True,
             )
         except OSError as exc:
-            logger.warning("mmap tracer failed to start: %s", exc)
+            self.last_error = f"mmap tracer failed to start: {exc}"
+            logger.warning("%s", self.last_error)
             return False
         self._proc = proc
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, args=(proc,), daemon=True
+        )
+        self._stderr_thread.start()
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
         for pid in self._watching:
             self._send(f"+{pid}\n")
         return True
+
+    def _drain_stderr(self, proc) -> None:
+        """Keep the tracer's own error lines so a failure can name its cause.
+
+        The child prints one startup line on success and a libbpf reason when
+        loading or attaching fails. We never discard that reason.
+        """
+        if proc.stderr is None:
+            return
+        try:
+            for raw in proc.stderr:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                self._stderr_tail.append(line)
+                if "attached" in line:
+                    logger.info("mmap tracer: %s", line)
+        except (OSError, ValueError):
+            pass
 
     def _stop_tracer(self) -> None:
         proc, thread = self._proc, self._thread
@@ -230,6 +284,10 @@ class MmapWatcher:
                 pass
         if thread is not None:
             thread.join(timeout=2)
+        stderr_thread = self._stderr_thread
+        self._stderr_thread = None
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=2)
 
     def _send(self, data: str) -> None:
         proc = self._proc
@@ -257,11 +315,29 @@ class MmapWatcher:
             cb = self._on_event
             if cb is not None:
                 cb(pid, ino, count)
-        # Tracer exited (terminated by us or crashed): drop the stale ref so
-        # a later enable() can restart it.
+        # Tracer exited. If we did not ask it to stop, the user's request to
+        # trace has failed and must be reported now, with the child's reason.
         with self._lock:
-            self._proc = None
-            self._thread = None
+            expected = self._proc is not proc
+            if not expected:
+                self._proc = None
+                self._thread = None
+                self._watching.clear()
+                self._ino_cache.clear()
+        if not expected:
+            stderr_thread = self._stderr_thread
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=1.0)
+            code = proc.poll()
+            reason = (
+                self._stderr_tail[-1]
+                if self._stderr_tail
+                else f"tracer exited without output (code {code})"
+            )
+            self.last_error = reason
+            logger.warning("mmap tracing failed: %s", reason)
+            if self._on_failure is not None:
+                self._on_failure(reason)
 
     # ── inode → path resolution ──────────────────────────────────────
     def resolve_path(self, pid: int, ino: int) -> Path | None:

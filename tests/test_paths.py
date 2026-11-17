@@ -405,3 +405,21 @@ def test_on_mmap_drops_paths_outside_the_pool(tmp_path):
     c._on_mmap(99, 1234, 1)
 
     assert c._accumulators == {}
+
+
+def test_unresolved_mmap_is_reported_once(tmp_path, caplog):
+    """Faults that cannot be named must be visible, not silently dropped."""
+    c = _collector(tmp_path)
+    c._sampler = IOWaitSampler([[]], [0], 10)
+    c._mmap_watcher.resolve_path = lambda pid, ino: None
+
+    c._on_mmap(99, 1234, 3)
+    assert c._mmap_notice is not None
+    assert "FUSE inode" in c._mmap_notice
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+
+    c._mmap_notice = None
+    c._on_mmap(99, 1235, 1)
+    assert c._mmap_notice is None  # only the first one is shouted about
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
