@@ -62,8 +62,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
     logger.info("pool=%s data=%s", pool.mount, data_path)
     for b in pool.branches:
-        kind = "HDD" if b.rotational else "SSD"
-        logger.info("branch: %s [%s] on %s", b.path, kind, b.device)
+        logger.info("branch: %s [%s %dx] on %s", b.path, b.speed_class, b.speed_weight, b.device)
 
     cfg = load_config()
     iowait_ms = args.iowait_interval or cfg.get("iowait_interval_ms", 10)
@@ -431,7 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
     wp.add_argument("--mmap-pid", type=int, action="append", default=[],
                     help="Watch mmap page-fault reads of this PID (repeatable; needs dimergio-mmap)")
     wp.add_argument("--no-sudo", dest="sudo", action="store_false",
-                    help="Run fatrace without sudo (requires CAP_SYS_ADMIN on fatrace binary)")
+                    help="Run fatrace without sudo (needs cap_sys_admin,cap_dac_read_search on the fatrace binary)")
     wp.add_argument("--iowait-interval", type=int, default=10,
                     help="I/O wait sampling interval in ms (default: 10 = 100Hz)")
     wp.add_argument("--verify", action="store_true",

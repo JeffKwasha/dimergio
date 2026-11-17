@@ -23,6 +23,7 @@ from dimergio.tui_keys import (
     apply_nav,
     decode_terminfo_escapes,
     normalize_key,
+    read_key,
     terminfo_keymap,
 )
 
@@ -451,3 +452,62 @@ def test_browse_enter_can_flip_in_preview():
     )
     assert assigns_in_preview, "browse handler should be able to enter preview"
     assert "in_preview" in nonlocals, "in_preview must be nonlocal or the flag never flips"
+
+
+# ─── read_key: a bare Esc must not block or eat the next key ────────
+def _reader(chunks, waits):
+    data = list(chunks)
+    gates = list(waits)
+
+    def read():
+        return data.pop(0) if data else None
+
+    def wait():
+        return gates.pop(0) if gates else False
+
+    return read, wait
+
+
+def test_read_key_bare_escape_returns_escape():
+    read, wait = _reader(["\x1b"], [False])
+    keymap = {"\x1bOA": "\x1b[A"}
+
+    assert read_key(read, wait, keymap) == "\x1b"
+
+
+def test_read_key_escape_then_other_key_does_not_swallow_it():
+    read, wait = _reader(["\x1b", "q"], [True])
+
+    assert read_key(read, wait, None) == "\x1bq"
+
+
+def test_read_key_plain_key():
+    read, wait = _reader(["q"], [])
+
+    assert read_key(read, wait, None) == "q"
+
+
+def test_read_key_csi_arrow_from_terminfo():
+    read, wait = _reader(["\x1b", "[", "A"], [True, True, False])
+    keymap = {"\x1b[A": "\x1b[A"}
+
+    assert read_key(read, wait, keymap) == "\x1b[A"
+
+
+def test_read_key_ss3_arrow_from_terminfo():
+    read, wait = _reader(["\x1b", "O", "D"], [True, True])
+    keymap = {"\x1bOD": "\x1b[D"}
+
+    assert read_key(read, wait, keymap) == "\x1b[D"
+
+
+def test_read_key_kitty_modified_arrow_without_keymap():
+    read, wait = _reader(["\x1b", "[", "1", ";", "5", "C"], [True, True, True, True, True, False])
+
+    assert read_key(read, wait, None) == "\x1b[C"
+
+
+def test_read_key_timeout_mid_sequence_falls_back_to_dialect_table():
+    read, wait = _reader(["\x1b", "[", "A"], [True, False])
+
+    assert read_key(read, wait, None) == "\x1b["

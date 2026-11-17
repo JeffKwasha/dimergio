@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from typing import Callable
 
 _CSI_U_KEYS = {
     "1": "\x1b[H",   # Home
@@ -146,6 +147,54 @@ def terminfo_keymap() -> dict[str, str] | None:
         if seq:
             keymap[seq] = _TERMINFO_KEY_CAPS[name]
     return keymap or None
+
+
+def read_key(
+    read: Callable[[], str | None],
+    wait: Callable[[], bool],
+    keymap: dict[str, str] | None = None,
+) -> str | None:
+    """Assemble one keystroke from raw bytes without a blocking read after ESC.
+
+    A terminal sends a bare ESC for the Esc key, so waiting for a follow-up
+    byte forever swallows it and lets the next keypress complete a phantom
+    escape sequence. ``wait`` reports whether another byte is available within
+    the escape timeout; a lone ESC is returned as-is.
+    """
+    ch = read()
+    if not ch:
+        return None
+    if ch != "\x1b":
+        return ch
+    if not wait():
+        return ch
+
+    ch2 = read()
+    if ch2 is None:
+        return ch
+    if ch2 not in "\x4f\x5b":
+        return ch + ch2
+
+    seq = ch + ch2
+    if ch2 == "\x4f":
+        # SS3/application-cursor mode: ESC O <final>.
+        if wait():
+            nxt = read()
+            if nxt:
+                seq += nxt
+    else:
+        # CSI: consume parameters (digits/;) until the final byte.
+        while wait():
+            c = read()
+            if not c:
+                break
+            seq += c
+            if c not in "0123456789;":
+                break
+
+    if keymap and seq in keymap:
+        return keymap[seq]
+    return normalize_key(seq)
 
 
 class Keys:

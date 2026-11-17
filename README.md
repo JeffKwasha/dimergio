@@ -165,7 +165,7 @@ Commands:
 | `--data PATH` | pool root | Restrict tracking to files under this directory |
 | `--pid N` | — | Auto-stop when PID N exits |
 | `--process NAME` | — | Auto-stop when process NAME stops reading |
-| `--sudo` | — | Run fatrace via sudo (needs CAP_SYS_ADMIN) |
+| `--sudo` | on | Run fatrace via sudo; `--no-sudo` needs capabilities on the fatrace binary |
 | `--iowait-interval N` | 10 | I/O wait sampling interval in ms |
 | `--verify` | — | SHA256-verify each file after copy |
 | `--no-interactive` | — | Headless mode (no TUI) |
@@ -269,9 +269,19 @@ Missing keys are filled from defaults — you only need to list overrides.
 
 ## Permissions
 
-dimergio runs as your user by default. Fatrace requires `CAP_SYS_ADMIN`
-for fanotify access. Use `--sudo` to run fatrace via sudo. The tool
-checks for cached sudo credentials before starting the TUI.
+fatrace needs privilege. Run dimergio with `--sudo` and a sudoers rule, or
+give the fatrace binary two file capabilities and pass `--no-sudo`:
+
+```bash
+sudo setcap cap_sys_admin,cap_dac_read_search+ep /usr/local/bin/fatrace
+```
+
+`cap_sys_admin` lets fanotify start. `cap_dac_read_search` lets modern fatrace
+turn an event handle back into a path through `open_by_handle_at`. With only
+the first, every event prints `(deleted)` and dimergio drops it, because the
+parser needs a path.
+
+The tool checks for cached sudo credentials before starting the TUI.
 
 The **target branch** must be writable by your user (or by root if
 using `--sudo`).

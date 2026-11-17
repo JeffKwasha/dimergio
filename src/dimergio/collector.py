@@ -31,7 +31,7 @@ from .pool import (
     resolve_tracked,
     volume_mounts,
 )
-from .tui_keys import Keys, apply_nav, normalize_key, terminfo_keymap
+from .tui_keys import Keys, apply_nav, read_key, terminfo_keymap
 
 logger = logging.getLogger(__name__)
 
@@ -1170,56 +1170,27 @@ class Collector:
         _keymap = terminfo_keymap()
 
         def _read_raw_key() -> str | None:
-            """Read a single keystroke directly from the raw terminal.
+            """Read a single keystroke from the raw terminal.
 
-            Assembles escape sequences ourselves (mirroring readchar.readkey()
-            but avoiding its TCSAFLUSH which drops buffered keystrokes) and
-            decodes them to the canonical readchar constants — first against
-            this terminal's terminfo entry, then the built-in dialect table
-            (CSI, SS3/application-mode, xterm alternate, kitty CSI-u).
+            Escape sequences are assembled in tui_keys.read_key, which waits a
+            bounded time after a bare ESC so the Esc key still arrives as Esc.
             """
-            try:
-                ch = sys.stdin.read(1)
-            except (OSError, ValueError):
-                return None
-            if not ch:
-                return None
+            import select
 
-            if ch != "\x1b":
-                return ch
-
-            try:
-                ch2 = sys.stdin.read(1)
-            except (OSError, ValueError):
-                return ch
-            if ch2 not in "\x4f\x5b":
-                return ch + ch2
-
-            seq = ch + ch2
-            if ch2 == "\x4f":
-                # SS3/application-cursor mode: ESC O <final>.
+            def _read() -> str | None:
                 try:
-                    seq += sys.stdin.read(1)
+                    ch = sys.stdin.read(1)
                 except (OSError, ValueError):
-                    pass
-                if _keymap and seq in _keymap:
-                    return _keymap[seq]
-                return normalize_key(seq)
+                    return None
+                return ch or None
 
-            # CSI: consume parameters (digits/;) until the final byte.
-            while True:
+            def _wait() -> bool:
                 try:
-                    c = sys.stdin.read(1)
+                    return bool(select.select([sys.stdin], [], [], 0.05)[0])
                 except (OSError, ValueError):
-                    break
-                if not c:
-                    break
-                seq += c
-                if c not in "\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39;":
-                    break
-            if _keymap and seq in _keymap:
-                return _keymap[seq]
-            return normalize_key(seq)
+                    return False
+
+            return read_key(_read, _wait, _keymap)
 
         def _key_reader() -> None:
             while not _stop_reader.is_set():

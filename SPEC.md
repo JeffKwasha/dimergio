@@ -746,7 +746,10 @@ Options:
   --process NAME        Auto-quit when this process exits (matches /proc/<pid>/cmdline)
   --pid N               Auto-quit when this PID exits
   --mmap-pid N          Watch mmap page-fault reads of this PID (repeatable)
-  --sudo                Run fatrace via sudo (needs CAP_SYS_ADMIN for fanotify)
+  --sudo                Run fatrace via sudo. With --no-sudo the fatrace binary
+                        needs cap_sys_admin (fanotify) and cap_dac_read_search
+                        (open_by_handle_at, without it every event resolves to
+                        "(deleted)" and is dropped)
   --iowait-interval N   I/O wait sampling interval in ms [default: 10]
   --verify              SHA256-verify each file after copy
   --no-interactive      Disable interactive PID monitor (headless mode)
