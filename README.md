@@ -317,13 +317,15 @@ fatrace -f RW -u -t -p <pid>
 collector._parse_line()          ─── ReadEvent (timestamp, proc, pid, uid, event, path)
     │                                PidStat (process_name from /proc/<pid>/comm)
     │
-    ├── collector.IOWaitSampler    ─── iowait_sec (domain busy time / events)
+    ├── collector.IOWaitSampler    ─── bills each window's busy time to the
+    │                                  (file, pid) reads seen in that window
     │
     ├── collector._accumulate()    ─── FileAccumulator.total_reads++  (R events)
     │                                  FileAccumulator.write_count++   (W events)
-    │                                  FileAccumulator.iowait_debt += iowait_sec
     │
-    ├── collector._update_pid_stats() ── PidStat.read_count++, pid_iowait_sec[pid] += iowait_sec
+    ├── collector._charge()        ─── FileAccumulator.iowait_debt += billed seconds
+    │
+    ├── collector._update_pid_stats() ── PidStat.read_count++
     │                                    PidStat.write_count++ on W events
     │
     └── TUI (BROWSE mode) ────── Live observation + selection on one screen
@@ -344,8 +346,9 @@ BROWSE mode ────────────────────── B
 
 ## Key Concepts
 
-- **I/O debt** — per-file score: sum of iowait_sec at each read event.
-  Higher = more I/O impact. Default ranking metric.
+- **I/O debt** — per-file score: the device busy time billed to this
+  file's reads, split by how many reads shared each window. Higher = more
+  I/O impact. Default ranking metric.
 - **Speed class** — auto-detected tier: `nvme`, `ssd`, or `hdd`.
 - **Speed weight** — relative throughput: nvme=10, ssd=4, hdd=1.
 - **Effective size** — file size rounded up to the 128 KiB SSD block floor;

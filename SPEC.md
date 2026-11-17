@@ -19,7 +19,7 @@ benchmarking is performed. No assumptions are made about hardware latency.
 | **branch stats** | Per-branch cumulative totals: reads, writes, iowait_sec. Computed on-demand from per-file data, not maintained separately. |
 | **candidate** | A tracked file with observed reads and no writes, so it can be selected for a move. |
 | **effective size** | File size rounded up to the 128 KiB SSD block floor, minimum one block. Denominates the iowait-per-MB ranking. |
-| **iowait debt** | Per-file score: sum of iowait_sec at each read event. Higher = more I/O impact. Primary ranking metric. |
+| **iowait debt** | Per-file score: sum of the I/O wait billed to this file's reads. Higher = more I/O impact. Primary ranking metric. |
 | **observation session** | The period during which fatrace is running and the TUI is active. Runs in interactive mode (Rich TUI) or passive mode (headless). |
 
 ## 3. Architecture
@@ -55,13 +55,16 @@ fatrace -f RW -u -t -p <pid>
 collector._parse_line()          ─── ReadEvent(timestamp, proc, pid, uid, event_type, file_path)
     │                                Also: PidStat.process_name (resolved from /proc/<pid>/comm)
     │
-    ├── IOWaitSampler  ─── iowait_sec (domain busy time / events)
+    ├── IOWaitSampler              ─── bills each window's domain busy time to
+    │                                  the (file, pid) reads seen in that window
     │
     ├── collector._accumulate()    ─── FileAccumulator.total_reads++  (R events)
     │                                  FileAccumulator.write_count++   (W events)
-    │                                  FileAccumulator.iowait_debt += iowait_sec
     │
-    ├── collector._update_pid_stats() ── PidStat.read_count++, pid_iowait_sec[pid] += iowait_sec
+    ├── collector._charge()        ─── FileAccumulator.iowait_debt += billed seconds
+    │                                  PidStat.total_iowait_sec += billed seconds
+    │
+    ├── collector._update_pid_stats() ── PidStat.read_count++
     │                                    PidStat.write_count++ on W events
     │
     └── TUI (BROWSE mode) ────── Live observation + selection on one screen
@@ -223,28 +226,28 @@ device queue, so their busy time must not be attributed separately. A branch's
 device set comes from its mount source plus the btrfs device list in
 `/sys/fs/btrfs`.
 
-Per domain, per sample:
+The sampler bills at the tick that closes each window:
 
 ```
-busy_delta_ms = sum(io_ticks[t] - io_ticks[t-1] for each device in the domain)
-pending_ms   += busy_delta_ms
-share_ms      = pending_ms / events_this_window     # 0 when no events arrived
-pending_ms    = 0
-events        = 0
+busy_ms   = sum(io_ticks[t] - io_ticks[t-1] for each device in the domain)
+counts    = {(path, pid): reads recorded since the last tick}
+total     = sum(counts.values())
+per_read  = busy_ms / total if total else 0
+charge[(path, pid)] += reads * per_read        # seconds reach the accumulator
+counts    = {}                                 # nothing carries over
 ```
 
 `io_ticks` is wall-clock time the device spent doing I/O, so summing it across
-a domain's devices is the queue's busy time, not a percentage. Counters that
-go backwards (device replaced, hotplug) are ignored rather than charged
-negative.
+a domain's devices is the queue's busy time, not a percentage. Counters that go
+backwards (device replaced, hotplug) are ignored rather than charged negative.
 
-**Attribution.** `get_busy(branch_idx)` returns the share computed at the
-previous tick, in seconds. Reads that arrive in one window are charged the
-previous window's busy time divided by the previous window's event count. That
-one-window lag is what makes concurrent reads share the cost instead of each
-claiming the whole busy time. Idle windows charge nothing. The running total
-(`total_iowait_sec`) accumulates regardless of events and feeds the analysis
-denominator.
+**Attribution.** A read is billed the busy time of its own window, in
+proportion to its share of the reads that arrived in that window. A window with
+one read bills that read the whole window. A window with no reads bills nobody,
+because no observed read explains that busy time. Because the bill arrives at
+the tick, the read itself is counted immediately and its `iowait_debt` grows a
+moment later. The running total (`total_iowait_sec`) counts all device busy
+time regardless of billing and feeds the `ΔIO` display.
 
 ### 5.5 Event Capture
 
@@ -261,8 +264,8 @@ On each fatrace line (from the main thread):
 5. **Branch resolution** (`pool.branch_holding`): the branch that actually holds
    the file, or a drop when no branch does. A read is never charged to a
    guessed branch.
-6. **IOWait**: `get_busy()` for that branch's domain
-7. **Accumulate**: update the FileAccumulator for this path
+6. **Accumulate**: count the read on the FileAccumulator for this path
+7. **Record**: `sampler.record_event(branch_idx, (path, pid))` for billing at the next tick
 8. **PID tracking**: update PidStat (read_count, write_count, process_name from `/proc/<pid>/comm`)
 9. **Return** ReadEvent for TUI consumption
 
@@ -281,15 +284,17 @@ class FileAccumulator:
     target_branch_idx: int | None = None   # SELECT-mode intent
     display_name: str = ""   # symlink path for display only
 
-    def observe(self, ts: float, iowait_sec: float) -> None:
-        self.observe_n(ts, iowait_sec, 1)
+    def observe(self, ts: float) -> None:
+        self.observe_n(ts, 1)
 
-    def observe_n(self, ts: float, iowait_sec: float, n: int) -> None:
+    def observe_n(self, ts: float, n: int) -> None:
         self.total_reads += n
-        self.iowait_debt += iowait_sec * n
         if not self.first_seen:
             self.first_seen = ts
         self.last_seen = ts
+
+    def charge(self, seconds: float) -> None:
+        self.iowait_debt += seconds
 ```
 
 ### 5.7 PidStat

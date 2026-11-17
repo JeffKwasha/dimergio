@@ -288,7 +288,7 @@ def _parse_log(log_path: Path, pool, data_path: Path) -> dict:
             else:
                 acc = FileAccumulator(path=file_path, branch_idx=branch_idx, first_seen=ts)
                 accumulators[file_path] = acc
-            acc.observe(ts, 0.0)
+            acc.observe(ts)
 
     return accumulators
 

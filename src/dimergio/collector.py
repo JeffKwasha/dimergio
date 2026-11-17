@@ -11,6 +11,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .model import (
     FileAccumulator,
@@ -79,15 +80,15 @@ def _read_diskstats() -> dict[str, int]:
 
 
 class IOWaitSampler:
-    """Samples per-device I/O busy-time and attributes it to read events.
+    """Bills per-domain device busy time to the reads that arrived in that window.
 
-    Branches are grouped into *IO domains* — all branches on the same set of
-    physical block devices (i.e. same btrfs pool) share one domain.  Each
-    polling window's delta ``io_ticks`` across *every* device in a domain is
-    summed into the domain's pending bucket.  At the next sample the bucket
-    is divided evenly among the read events that arrived during the window
-    and set as the per-event share for the *following* window (one-window
-    lag), providing fair attribution across concurrent events.
+    Branches are grouped into *IO domains*: all branches on the same set of
+    physical block devices (one btrfs pool) share a domain. Each window's
+    ``io_ticks`` delta across every device in a domain is summed, then at the
+    tick that closes the window it is split across the read events recorded
+    during that window, in proportion to each file's share of the count. A
+    window with no reads drops its busy time, because no observed read
+    explains it. Nothing is carried between windows.
     """
 
     MIN_INTERVAL_MS = 5
@@ -98,6 +99,7 @@ class IOWaitSampler:
         br2domain: list[int],
         interval_ms: int = 10,
         debug_log: Path | None = None,
+        on_charge: "Callable[[dict[object, float]], None] | None" = None,
     ):
         self._domains = domains
         self._br2domain = br2domain
@@ -105,10 +107,10 @@ class IOWaitSampler:
         self._interval = interval_ms / 1000
         nd = len(domains)
         self._pending_ms: list[float] = [0.0] * nd
-        self._event_counts: list[int] = [0] * nd
-        self._share_ms: list[float] = [0.0] * nd
+        self._counts: list[dict[object, int]] = [{} for _ in domains]
         self._prev_ticks: dict[str, int] = {}
         self._total_iowait_ms: float = 0.0
+        self._on_charge = on_charge
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -137,11 +139,12 @@ class IOWaitSampler:
         self._interval_ms = ms
         self._interval = ms / 1000
 
-    def record_events(self, branch_idx: int, n: int) -> None:
-        """Accumulate ``n`` read events for one branch in a single lock take."""
+    def record_event(self, branch_idx: int, key: object, n: int = 1) -> None:
+        """Count ``n`` reads for ``key`` in this branch's window."""
         domain_idx = self._br2domain[branch_idx]
         with self._lock:
-            self._event_counts[domain_idx] += n
+            counts = self._counts[domain_idx]
+            counts[key] = counts.get(key, 0) + n
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -159,16 +162,6 @@ class IOWaitSampler:
             self._debug_fh = None
             fh.close()
 
-    def get_busy(self, branch_idx: int) -> float:
-        """Return this event's pre-computed share of pending I/O wait (seconds).
-
-        The share was computed at the last sampling tick by dividing the
-        previous window's accumulated device busy time evenly among the
-        events that arrived during that window (one-window lag).
-        """
-        domain_idx = self._br2domain[branch_idx]
-        return self._share_ms[domain_idx] / 1000.0
-
     def _run(self) -> None:
         initial = _read_diskstats()
         for devices in self._domains:
@@ -180,8 +173,9 @@ class IOWaitSampler:
             self._sample_once(_read_diskstats())
 
     def _sample_once(self, stats: dict[str, int]) -> None:
-        """Fold one diskstats snapshot into the per-domain shares."""
+        """Close one window: bill its busy time to the reads that arrived in it."""
         timestamp = datetime.datetime.now().isoformat()
+        charges: dict[object, float] = {}
         with self._lock:
             for domain_idx, devices in enumerate(self._domains):
                 total_delta = 0
@@ -196,25 +190,27 @@ class IOWaitSampler:
                         total_delta += delta
 
                 pending_ms = self._pending_ms[domain_idx] + total_delta
-                self._pending_ms[domain_idx] = pending_ms
+                self._pending_ms[domain_idx] = 0.0
                 self._total_iowait_ms += total_delta
 
-                cnt = self._event_counts[domain_idx]
-                if cnt > 0:
-                    self._share_ms[domain_idx] = pending_ms / cnt
-                else:
-                    self._share_ms[domain_idx] = 0.0
-
-                self._pending_ms[domain_idx] = 0.0
-                self._event_counts[domain_idx] = 0
+                counts = self._counts[domain_idx]
+                self._counts[domain_idx] = {}
+                total = sum(counts.values())
+                share_ms = pending_ms / total if total else 0.0
+                for key, cnt in counts.items():
+                    amount = cnt * share_ms / 1000.0
+                    if amount > 0:
+                        charges[key] = charges.get(key, 0.0) + amount
 
                 if self._debug_fh is not None:
                     self._debug_fh.write(
                         f"{timestamp} {domain_idx} {','.join(devices)} "
-                        f"{pending_ms:.1f} "
-                        f"{self._share_ms[domain_idx]:.3f} {cnt}\n"
+                        f"{pending_ms:.1f} {share_ms:.3f} {total}\n"
                     )
                     self._debug_fh.flush()
+
+        if charges and self._on_charge is not None:
+            self._on_charge(charges)
 
 
 class Collector:
@@ -338,7 +334,6 @@ class Collector:
         s = self._ensure_pid_stat(event.pid, event.process_name, event.timestamp)
         s.read_count += 1
         s.last_seen = event.timestamp
-        s.total_iowait_sec += event.iowait_sec
         s.process_name = event.process_name
 
     def _is_process_alive(self, name: str) -> bool:
@@ -405,7 +400,7 @@ class Collector:
                 if event is not None:
                     if self._verbose:
                         logger.info("  → event: br=%d pid=%d path=%s", event.branch_idx, event.pid, event.file_path)
-                    sampler.record_events(event.branch_idx, 1)
+                    sampler.record_event(event.branch_idx, (event.file_path, event.pid))
                     self._accumulate(event, sampler)
                 elif self._verbose:
                     logger.info("  → dropped")
@@ -460,7 +455,11 @@ class Collector:
 
         domains, br2domain = io_domains(self.pool.branches, read_mounts())
         sampler = IOWaitSampler(
-            domains, br2domain, self.iowait_interval_ms, debug_log=self._debug_log
+            domains,
+            br2domain,
+            self.iowait_interval_ms,
+            debug_log=self._debug_log,
+            on_charge=self._charge,
         )
         sampler.start()
         self._sampler = sampler
@@ -1313,7 +1312,6 @@ class Collector:
             gid=int(m.group("gid")),
             timestamp=ts,
             branch_idx=branch_idx,
-            iowait_sec=0.0,
         )
 
     def _get_acc(self, path: Path, branch_idx: int, ts: float) -> FileAccumulator:
@@ -1331,13 +1329,25 @@ class Collector:
             return acc
 
     def _accumulate(self, event: ReadEvent, sampler: IOWaitSampler) -> None:
-        iowait = sampler.get_busy(event.branch_idx)
-        event.iowait_sec = iowait
-
         self._update_pid_stats(event)
-        self._get_acc(event.file_path, event.branch_idx, event.timestamp).observe(
-            event.timestamp, iowait
-        )
+        acc = self._get_acc(event.file_path, event.branch_idx, event.timestamp)
+        acc.observe(event.timestamp)
+        sampler.record_event(event.branch_idx, (event.file_path, event.pid))
+
+    def _charge(self, charges: dict[object, float]) -> None:
+        """Apply a closed window's bill, in seconds, to files and pids.
+
+        Runs on the sampler thread. Keys are ``(pool path, pid)`` because the
+        accumulator itself is not hashable.
+        """
+        for key, seconds in charges.items():
+            path, pid = key
+            acc = self._accumulators.get(path)
+            if acc is not None:
+                acc.charge(seconds)
+            stat = self._pid_stats.get(pid)
+            if stat is not None:
+                stat.total_iowait_sec += seconds
 
     def _on_mmap(self, pid: int, ino: int, count: int) -> None:
         """Merge an aggregated mmap page-fault window from the eBPF tracer.
@@ -1369,9 +1379,8 @@ class Collector:
             s.process_name = comm or s.process_name
 
         acc = self._get_acc(norm, branch_idx, ts)
-        iowait = self._sampler.get_busy(branch_idx)
-        acc.observe_n(ts, iowait, count)
-        self._sampler.record_events(branch_idx, count)
+        acc.observe_n(ts, count)
+        self._sampler.record_event(branch_idx, (norm, pid), count)
 
     def _resolve_branch(self, path: Path) -> int | None:
         """Index of the branch holding ``path``, cached, or None when none does."""

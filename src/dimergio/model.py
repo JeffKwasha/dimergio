@@ -92,7 +92,6 @@ class ReadEvent:
     gid: int
     timestamp: float
     branch_idx: int
-    iowait_sec: float
 
 
 @dataclass(slots=True)
@@ -109,17 +108,19 @@ class FileAccumulator:
     # for display only — ``path`` always stays the real file location.
     display_name: str = ""
 
-    def observe(self, ts: float, iowait_sec: float) -> None:
-        self.observe_n(ts, iowait_sec, 1)
+    def observe(self, ts: float) -> None:
+        self.observe_n(ts, 1)
 
-    def observe_n(self, ts: float, iowait_sec: float, n: int) -> None:
-        """Record ``n`` read events in one call (used for aggregated mmap
-        page-fault windows where each fault is one read)."""
+    def observe_n(self, ts: float, n: int) -> None:
+        """Count ``n`` reads in one call (an mmap window is n faults)."""
         self.total_reads += n
-        self.iowait_debt += iowait_sec * n
         if not self.first_seen:
             self.first_seen = ts
         self.last_seen = ts
+
+    def charge(self, seconds: float) -> None:
+        """Bill the I/O wait this file's reads caused in a closed window."""
+        self.iowait_debt += seconds
 
 
 @dataclass(slots=True)

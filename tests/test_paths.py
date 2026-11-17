@@ -114,7 +114,6 @@ def test_accumulate_sets_display_name(tmp_path):
         gid=1000,
         timestamp=1.0,
         branch_idx=0,
-        iowait_sec=0.0,
     )
     c._accumulate(ev, IOWaitSampler([[]], [0], 10))
     acc = c._accumulators[tmp_path / "pool" / "data" / "real.bin"]
@@ -393,7 +392,7 @@ def test_on_mmap_folds_faults_into_reads_and_iowait(tmp_path):
     acc = c._accumulators[tmp_path / "pool" / "data" / "real.bin"]
     assert acc.total_reads == 5
     assert c._pid_stats[99].read_count == 5
-    assert sampler._event_counts[0] == 5
+    assert sampler._counts[0] == {(pool_path, 99): 5}
 
 
 def test_on_mmap_drops_paths_outside_the_pool(tmp_path):
