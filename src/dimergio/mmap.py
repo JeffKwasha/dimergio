@@ -235,7 +235,7 @@ class MmapWatcher:
         proc = self._proc
         if proc is not None and proc.stdin is not None:
             try:
-                proc.stdin.write(data)
+                proc.stdin.write(data.encode())
                 proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 pass

@@ -121,7 +121,7 @@ def _blocking_proc() -> tuple[mock.MagicMock, threading.Event]:
 
     fake_proc = mock.MagicMock()
     fake_proc.stdout = lines()
-    fake_proc.stdin = io.StringIO()
+    fake_proc.stdin = io.BytesIO()
     fake_proc.terminate.side_effect = stop.set
     return fake_proc, stop
 
@@ -136,7 +136,7 @@ def test_enable_streams_events():
 
     fake_proc = mock.MagicMock()
     fake_proc.stdout = io.BytesIO(b"101 42 3\n102 43 7\ngarbage line\n100 44 2\n")
-    fake_proc.stdin = io.StringIO()
+    fake_proc.stdin = io.BytesIO()
     with mock.patch("dimergio.mmap.subprocess.Popen", return_value=fake_proc):
         assert w.enable(101, on_event)
     assert w._thread is not None
@@ -187,7 +187,7 @@ def test_set_interval_sends_i_command():
     with mock.patch("dimergio.mmap.subprocess.Popen", return_value=fake_proc):
         w.enable(101, lambda *a: None)
         w.set_interval_ms(33)
-    assert "i 33\n" in fake_proc.stdin.getvalue()
+    assert b"i 33\n" in fake_proc.stdin.getvalue()
     w.stop()
 
 
@@ -199,7 +199,7 @@ def test_tracer_detaches_from_controlling_terminal(monkeypatch):
     w = _watcher(binary="/fake")
     fake_proc = mock.MagicMock()
     fake_proc.stdout = io.BytesIO(b"")
-    fake_proc.stdin = io.StringIO()
+    fake_proc.stdin = io.BytesIO()
     with mock.patch("dimergio.mmap.subprocess.Popen", return_value=fake_proc) as popen:
         assert w.enable(101, lambda *a: None)
     kwargs = popen.call_args.kwargs
@@ -225,7 +225,7 @@ def test_tracer_sudo_runs_passwordless_and_detached(monkeypatch):
     monkeypatch.setattr(mm.subprocess, "run", mock.MagicMock(return_value=SimpleNamespace(returncode=0)))
     fake_proc = mock.MagicMock()
     fake_proc.stdout = io.BytesIO(b"")
-    fake_proc.stdin = io.StringIO()
+    fake_proc.stdin = io.BytesIO()
     popen = mock.MagicMock(return_value=fake_proc)
     monkeypatch.setattr(mm.subprocess, "Popen", popen)
     w = MmapWatcher(path_ok=lambda p: True, binary="/fake", use_sudo=True)
@@ -252,3 +252,48 @@ def test_parser_watch_mmap_pid_accumulates():
     ns = build_parser().parse_args(["watch", "--mmap-pid", "42", "--mmap-pid", "43"])
     assert ns.command == "watch"
     assert ns.mmap_pid == [42, 43]
+
+def test_send_writes_bytes_to_the_tracer():
+    """The pipes are binary; a str write raised TypeError at runtime."""
+    import subprocess
+    import sys
+
+    echo = [sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.readline())"]
+    proc = subprocess.Popen(echo, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    w = _watcher(binary="/bin/true")
+    w._proc = proc
+    try:
+        w._send("+42\n")
+        assert proc.stdout.readline() == b"+42\n"
+    finally:
+        proc.terminate()
+        proc.wait(timeout=2)
+
+
+def test_watcher_runs_the_tracer_and_reports_faults(tmp_path):
+    """End to end over a real child process: start, command, events, stop."""
+    import time
+
+    tracer = tmp_path / "fake-tracer"
+    tracer.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "for line in sys.stdin:\n"
+        "    if line.startswith('+'):\n"
+        "        pid = line[1:].strip()\n"
+        "        print(f'{pid} 4242 7', flush=True)\n"
+    )
+    tracer.chmod(0o755)
+
+    events = []
+    w = _watcher(binary=str(tracer))
+    try:
+        assert w.enable(1234, lambda pid, ino, count: events.append((pid, ino, count)))
+        for _ in range(200):
+            if events:
+                break
+            time.sleep(0.01)
+    finally:
+        w.stop()
+
+    assert events and events[0] == (1234, 4242, 7)
