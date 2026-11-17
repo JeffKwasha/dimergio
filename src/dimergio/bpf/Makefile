@@ -58,7 +58,7 @@ dimergio-mmap: mmap_tracer.c mmap_tracer.skel.h
 
 install: dimergio-mmap
 	install -d $(DESTDIR)$(PREFIX)/bin
-	install -m 0755 dimergio-mmap $(DESTDIR)$(PREFIX)/bin/dimergio-mmap
+	install -m 0750 dimergio-mmap $(DESTDIR)$(PREFIX)/bin/dimergio-mmap
 
 clean:
 	rm -f dimergio-mmap mmap_tracer mmap_tracer.bpf.o mmap_tracer.skel.h vmlinux.h
