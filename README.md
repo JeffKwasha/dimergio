@@ -99,12 +99,12 @@ list. You can start a PID under watch directly with `--mmap-pid N` (repeatable).
 Without the tracer, mmap detection degrades to a no-op: `m` still lists
 candidates and `Enter` reports why it cannot watch them.
 
-One limit applies today. Faults are keyed by the inode the kernel faulted on.
-A file mapped through the mergerfs mount faults on the backing file, so the
-tracer reports the backing inode while the mapping in `/proc/<pid>/maps` shows
-a FUSE inode. Such faults cannot be named yet, so dimergio reports the mismatch
-once instead of counting them. Files mapped directly from a branch or through
-the btrfs volume do resolve and count.
+Faults are matched to files by the start address of the mapping they happened
+in, looked up in `/proc/<pid>/maps`. That indirection is what makes the pool
+case work: a file mapped through mergerfs faults on its backing file, so the
+kernel's inode does not match the FUSE inode userspace can see, but the mapping
+address does. If a mapping is replaced or unmapped before dimergio can look it
+up, the fault is dropped and the first such miss is reported once.
 
 Files are ranked by **iowait cost per MB** (byte-weighted: file size rounded
 up to the 128 KiB SSD block floor), so large slow files outrank tiny ones with

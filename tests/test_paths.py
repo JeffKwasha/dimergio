@@ -415,7 +415,7 @@ def test_unresolved_mmap_is_reported_once(tmp_path, caplog):
 
     c._on_mmap(99, 1234, 3)
     assert c._mmap_notice is not None
-    assert "FUSE inode" in c._mmap_notice
+    assert "no mapping matched" in c._mmap_notice
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
 

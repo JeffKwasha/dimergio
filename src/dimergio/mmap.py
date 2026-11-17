@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -52,6 +53,9 @@ class MmapWatcher:
     per-window scans of the whole mapping.
     """
 
+    # A cached /proc/<pid>/maps is re-read when a lookup misses after this long.
+    MAPS_TTL_S = 2.0
+
     def __init__(
         self,
         path_ok: Callable[[Path], bool],
@@ -69,7 +73,8 @@ class MmapWatcher:
         self._stderr_thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._watching: set[int] = set()
-        self._ino_cache: dict[int, dict[int, Path]] = {}
+        # pid -> (mapping start -> path, when the map was built)
+        self._map_cache: dict[int, tuple[dict[int, Path], float]] = {}
         self._candidates: list[MmapCandidate] = []
         self._on_event: Callable[[int, int, int], None] | None = None
         self._on_failure = on_failure
@@ -185,7 +190,7 @@ class MmapWatcher:
             if pid not in self._watching:
                 return
             self._watching.discard(pid)
-            self._ino_cache.pop(pid, None)
+            self._map_cache.pop(pid, None)
             if self._proc is not None:
                 self._send(f"-{pid}\n")
             should_stop = not self._watching
@@ -201,7 +206,7 @@ class MmapWatcher:
     def stop(self) -> None:
         with self._lock:
             self._watching.clear()
-            self._ino_cache.clear()
+            self._map_cache.clear()
         self._stop_tracer()
 
     def _start_tracer(self) -> bool:
@@ -309,12 +314,12 @@ class MmapWatcher:
             if len(parts) != 3:
                 continue
             try:
-                pid, ino, count = int(parts[0]), int(parts[1]), int(parts[2])
+                pid, addr, count = int(parts[0]), int(parts[1]), int(parts[2])
             except ValueError:
                 continue
             cb = self._on_event
             if cb is not None:
-                cb(pid, ino, count)
+                cb(pid, addr, count)
         # Tracer exited. If we did not ask it to stop, the user's request to
         # trace has failed and must be reported now, with the child's reason.
         with self._lock:
@@ -323,7 +328,7 @@ class MmapWatcher:
                 self._proc = None
                 self._thread = None
                 self._watching.clear()
-                self._ino_cache.clear()
+                self._map_cache.clear()
         if not expected:
             stderr_thread = self._stderr_thread
             if stderr_thread is not None:
@@ -340,32 +345,42 @@ class MmapWatcher:
                 self._on_failure(reason)
 
     # ── inode → path resolution ──────────────────────────────────────
-    def resolve_path(self, pid: int, ino: int) -> Path | None:
-        """Resolve a (pid, inode) pair to a mapped file path via
-        /proc/<pid>/maps, cached per pid."""
-        with self._lock:
-            cache = self._ino_cache.get(pid)
-        if cache is None:
-            cache = self._build_ino_map(pid)
-            with self._lock:
-                self._ino_cache[pid] = cache
-        return cache.get(ino)
+    def resolve_path(self, pid: int, addr: int) -> Path | None:
+        """Resolve a mapping start address to the file behind it.
 
-    def _build_ino_map(self, pid: int) -> dict[int, Path]:
+        Inodes cannot identify a mapping here: a file mapped through mergerfs
+        faults on its backing file, so the kernel's inode never matches the
+        FUSE inode in /proc/<pid>/maps. The mapping start address does, and the
+        line that carries it also carries the path the process opened.
+        """
+        with self._lock:
+            cached = self._map_cache.get(pid)
+        if cached is not None:
+            paths, built = cached
+            if addr in paths:
+                return paths[addr]
+            if time.monotonic() - built < self.MAPS_TTL_S:
+                return None
+        paths = self._build_addr_map(pid)
+        with self._lock:
+            self._map_cache[pid] = (paths, time.monotonic())
+        return paths.get(addr)
+
+    def _build_addr_map(self, pid: int) -> dict[int, Path]:
         d: dict[int, Path] = {}
         try:
             with open(f"/proc/{pid}/maps") as f:
                 for line in f:
                     parts = line.split()
-                    if len(parts) >= 6 and parts[5].startswith("/"):
-                        if "(deleted)" in line:
-                            continue
-                        path = Path(parts[5])
-                        try:
-                            st = path.stat()
-                        except OSError:
-                            continue
-                        d.setdefault(st.st_ino, path)
+                    if len(parts) < 6 or not parts[5].startswith("/"):
+                        continue
+                    if "(deleted)" in line:
+                        continue
+                    try:
+                        start = int(parts[0].split("-", 1)[0], 16)
+                    except ValueError:
+                        continue
+                    d[start] = Path(parts[5])
         except OSError:
             pass
         return d

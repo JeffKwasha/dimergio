@@ -2,10 +2,13 @@
 /* dimergio mmap tracer — userspace half.
  *
  * Loads the CO-RE BPF program, attaches a kprobe to filemap_fault, and
- * drains the per-(pid, inode) fault counters every sampling window, printing
+ * drains the per-(pid, mapping) fault counters every sampling window, printing
  * one line per entry:
  *
- *     <pid> <ino> <count>
+ *     <pid> <vm_start> <count>
+ *
+ * The address is the start of the mapping the fault happened in; the collector
+ * resolves it to a path through /proc/<pid>/maps.
  *
  * Commands on stdin (no respawn needed):
  *     +<pid>      start tracing this pid
@@ -29,10 +32,10 @@
 
 static volatile sig_atomic_t g_stop = 0;
 
-/* Must match mmap_tracer.bpf.c — pid then ino, 16 bytes, no padding. */
+/* Must match mmap_tracer.bpf.c — pid then mapping start, 16 bytes, no padding. */
 struct fault_key {
     __u32 pid;
-    __u64 ino;
+    __u64 addr;
 };
 
 static void handle_signal(int sig)
@@ -79,7 +82,7 @@ static void dump_faults(struct mmap_tracer_bpf *skel)
             __u64 zero = 0;
             bpf_map__update_elem(map, &key, sizeof(key), &zero, sizeof(zero), BPF_EXIST);
             printf("%u %llu %llu\n",
-                   key.pid, (unsigned long long)key.ino, (unsigned long long)value);
+                   key.pid, (unsigned long long)key.addr, (unsigned long long)value);
         }
         err = bpf_map__get_next_key(map, &key, &next, sizeof(key));
         key = next;

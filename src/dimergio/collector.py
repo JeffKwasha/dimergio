@@ -1364,7 +1364,7 @@ class Collector:
             if stat is not None:
                 stat.total_iowait_sec += seconds
 
-    def _on_mmap(self, pid: int, ino: int, count: int) -> None:
+    def _on_mmap(self, pid: int, addr: int, count: int) -> None:
         """Merge an aggregated mmap page-fault window from the eBPF tracer.
 
         Each fault counts as one read event for iowait fairness and per-file
@@ -1372,7 +1372,7 @@ class Collector:
         """
         if count <= 0 or self._sampler is None:
             return
-        path = self._mmap_watcher.resolve_path(pid, ino)
+        path = self._mmap_watcher.resolve_path(pid, addr)
         if path is None:
             self._note_unresolved_mmap()
             return
@@ -1403,10 +1403,7 @@ class Collector:
         self._mmap_unresolved += 1
         if self._mmap_unresolved != 1:
             return
-        reason = (
-            "mmap faults seen but the mapped file could not be named: the fault "
-            "reports the backing inode, while a pool mapping shows a FUSE inode"
-        )
+        reason = "mmap faults seen but no mapping matched the faulting address"
         logger.warning("%s", reason)
         self._mmap_notice = reason
 

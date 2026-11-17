@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0
 /* dimergio mmap tracer — BPF half.
  *
- * Counts mmap(2) page-fault reads per (pid, inode) so dimergio can notice
- * model / data loads that fanotify (and therefore fatrace) never reports:
- * the kernel does not emit fanotify events for accesses that happen through
- * mmap page faults.
+ * Counts mmap(2) page-fault reads per (pid, mapping start) so dimergio can
+ * notice model / data loads that fanotify (and therefore fatrace) never
+ * reports: the kernel does not emit fanotify events for accesses that happen
+ * through mmap page faults.
  *
  * The hot path is deliberately tiny: one hash lookup on the enabled-pid
  * filter map plus one counter increment. No path string resolution happens
- * in-kernel; paths are resolved in userspace from /proc/<pid>/maps.
+ * in-kernel; the mapping start is looked up in /proc/<pid>/maps by userspace.
+ *
+ * The key is the mapping's start address rather than the file's inode because
+ * inodes are per-filesystem: a file mapped through mergerfs faults on its
+ * backing file, whose inode never matches the FUSE inode userspace can see.
  */
 #include "vmlinux.h"
 
@@ -26,11 +30,11 @@ struct {
     __type(value, __u8);
 } enabled_pids SEC(".maps");
 
-/* Per (pid, inode) page-fault counters, drained by the userspace loop each
- * sampling window. */
+/* Per (pid, mapping start) page-fault counters, drained by the userspace loop
+ * each sampling window. */
 struct fault_key {
     __u32 pid;
-    __u64 ino;
+    __u64 addr;
 };
 
 struct {
@@ -48,22 +52,16 @@ int BPF_KPROBE(trace_filemap_fault, struct vm_fault *vmf)
         return 0;
 
     struct vm_area_struct *vma = NULL;
-    struct file *file = NULL;
-    struct inode *inode = NULL;
-    __u64 ino = 0;
+    unsigned long addr = 0;
 
     bpf_probe_read_kernel(&vma, sizeof(vma), &vmf->vma);
     if (!vma)
         return 0;
-    bpf_probe_read_kernel(&file, sizeof(file), &vma->vm_file);
-    if (!file)
+    bpf_probe_read_kernel(&addr, sizeof(addr), &vma->vm_start);
+    if (!addr)
         return 0;
-    bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
-    if (!inode)
-        return 0;
-    bpf_probe_read_kernel(&ino, sizeof(ino), &inode->i_ino);
 
-    struct fault_key key = { .pid = pid, .ino = ino };
+    struct fault_key key = { .pid = pid, .addr = addr };
     __u64 *count = bpf_map_lookup_elem(&faults, &key);
     if (count) {
         __sync_fetch_and_add(count, 1);

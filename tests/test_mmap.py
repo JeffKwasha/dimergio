@@ -75,45 +75,60 @@ def test_has_mapping_under_data():
         assert not w._has_mapping_under_data(123)
 
 
-# ─── inode → path resolution ───────────────────────────────────────
-def test_build_ino_map_skips_deleted(monkeypatch):
+# ─── mapping address → path resolution ─────────────────────────────
+def test_build_addr_map_skips_deleted():
     w = _watcher()
     maps = (
-        "7f..-7f.. r--p 00000000 00:1f 1001 /pool/model.bin (deleted)\n"
-        "7f..-7f.. r--p 00000000 00:1f 2002 /pool/model.bin\n"
-        "7f..-7f.. rw-p 00000000 00:1f 3003 /other/x\n"
+        "7f00-7f10 r--p 00000000 00:2b 1001 /pool/model.bin (deleted)\n"
+        "7f20-7f30 r--p 00000000 00:2b 2002 /pool/model.bin\n"
+        "7f40-7f50 rw-p 00000000 00:2b 3003 /other/x\n"
+        "7f60-7f70 r--p 00000000 00:2b 4004 [heap]\n"
     )
-    def fake_stat(self):
-        return SimpleNamespace(st_ino=1000 + len(str(self)))
-
-    monkeypatch.setattr(Path, "stat", fake_stat)
     with mock.patch("builtins.open", return_value=io.StringIO(maps)):
-        d = w._build_ino_map(123)
-    assert 1001 not in d  # (deleted) must not be resolved
-    assert d[1000 + len("/pool/model.bin")] == Path("/pool/model.bin")
-    assert d[1000 + len("/other/x")] == Path("/other/x")
+        d = w._build_addr_map(123)
+
+    assert 0x7F00 not in d  # (deleted) must not be resolved
+    assert d[0x7F20] == Path("/pool/model.bin")
+    assert d[0x7F40] == Path("/other/x")
 
 
 def test_resolve_path_caches_per_pid(monkeypatch):
     w = _watcher()
-    d = {77: Path("/pool/a"), 88: Path("/pool/b")}
-    monkeypatch.setattr(w, "_build_ino_map", lambda pid: d)
-    assert w.resolve_path(1, 77) == Path("/pool/a")
+    d = {0x1000: Path("/pool/a"), 0x2000: Path("/pool/b")}
+    monkeypatch.setattr(w, "_build_addr_map", lambda pid: d)
+    assert w.resolve_path(1, 0x1000) == Path("/pool/a")
+
     calls = []
 
     def rebuild(pid):
         calls.append(pid)
         return d
 
-    monkeypatch.setattr(w, "_build_ino_map", rebuild)
+    monkeypatch.setattr(w, "_build_addr_map", rebuild)
     # Cache hit: same pid must not rebuild /proc maps.
-    assert w.resolve_path(1, 88) == Path("/pool/b")
+    assert w.resolve_path(1, 0x2000) == Path("/pool/b")
     assert calls == []
+    # A miss inside the TTL does not rescan either.
+    assert w.resolve_path(1, 0x9999) is None
+    assert calls == []
+
+
+def test_resolve_path_rescans_after_ttl(monkeypatch):
+    w = _watcher()
+    clock = [100.0]
+    monkeypatch.setattr(mm.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(w, "_build_addr_map", lambda pid: {0x1000: Path("/pool/a")})
+    assert w.resolve_path(1, 0x1000) == Path("/pool/a")
+
+    fresh = {0x2000: Path("/pool/b")}
+    monkeypatch.setattr(w, "_build_addr_map", lambda pid: fresh)
+    clock[0] += w.MAPS_TTL_S + 1
+    assert w.resolve_path(1, 0x2000) == Path("/pool/b")
 
 
 def _blocking_proc() -> tuple[mock.MagicMock, threading.Event]:
     """A fake tracer proc whose stdout stays open until ``terminate`` is
-    called — mirrors a real subprocess the way the fatrace tests do."""
+    called, the way a real tracer behaves until we stop it."""
     stop = threading.Event()
 
     def lines():

@@ -503,12 +503,15 @@ and `cap_dac_read_search` for `open_by_handle_at`. Both binaries should be mode
 after any copy, `chown`, or rebuild, because the kernel strips
 `security.capability` from a new inode.
 
-Resolution limit: a fault is keyed by the inode the kernel faulted on. A file
-mapped through the mergerfs mount faults on its backing file, so the tracer
-reports the backing inode while `/proc/<pid>/maps` shows a FUSE inode. Those
-faults cannot be named, and the collector reports the mismatch once (log and
-TUI notice) rather than dropping them silently. Files mapped from a branch or
-the btrfs volume resolve and count.
+Attribution: a fault is keyed by the start address of the mapping it happened
+in, not by inode. Inodes are per-filesystem, and a file mapped through the
+mergerfs mount faults on its backing file, so the kernel's inode never matches
+the FUSE inode userspace can see. The mapping start address does match, and its
+line in `/proc/<pid>/maps` carries the path the process opened. The collector
+looks the address up in that file, caches the result per pid for two seconds,
+and re-reads it when an address misses. A mapping that is replaced or unmapped
+before it can be resolved is dropped, and the collector reports the first such
+miss once, in the log and in the TUI.
 
 - Press **`m`** to scan `/proc/<pid>/io` `read_bytes` for processes whose file
   mappings fall under the watched data path. Candidates are sorted by that
