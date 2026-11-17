@@ -1,21 +1,19 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
 import yaml
 
+from .config import load as load_config
 from .model import FileAccumulator, Pool
 
 logger = logging.getLogger(__name__)
 
-_STATS_FILENAME = ".dimergio.yaml"
-
 
 def _stats_path(pool: Pool) -> Path:
-    state_root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-    return state_root / "dimergio" / f"{pool.name}.yaml"
+    state_dir = Path(load_config()["state_dir"]).expanduser()
+    return state_dir / f"{pool.name}.yaml"
 
 
 def load_stats(pool: Pool) -> dict[str, dict]:
@@ -30,11 +28,11 @@ def load_stats(pool: Pool) -> dict[str, dict]:
         return {}
 
 
-def load_accumulators(pool: Pool, data_path: Path) -> dict[Path, FileAccumulator]:
+def load_accumulators(pool: Pool) -> dict[Path, FileAccumulator]:
     raw = load_stats(pool)
     result: dict[Path, FileAccumulator] = {}
     for rel_str, entry in raw.items():
-        full_path = data_path / rel_str
+        full_path = pool.mount / rel_str
         acc = FileAccumulator(
             path=full_path,
             branch_idx=0,
@@ -49,12 +47,12 @@ def load_accumulators(pool: Pool, data_path: Path) -> dict[Path, FileAccumulator
 def merge_stats(
     existing: dict[str, dict],
     accumulators: dict[Path, FileAccumulator],
-    data_path: Path,
+    pool: Pool,
 ) -> dict[str, dict]:
     result = dict(existing)
     for acc in accumulators.values():
         try:
-            rel = str(acc.path.relative_to(data_path))
+            rel = str(acc.path.relative_to(pool.mount))
         except ValueError:
             rel = acc.path.name
         if rel in result:

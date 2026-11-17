@@ -1,6 +1,15 @@
 __pycache__/
 *.pyc
 *.egg-info/
+build/
 .pytest_cache/
 *.swp
 *.swo
+
+# eBPF build artifacts. The tracer is built from source and installed on PATH.
+src/dimergio/bpf/vmlinux.h
+src/dimergio/bpf/*.bpf.o
+src/dimergio/bpf/*.skel.h
+src/dimergio/bpf/mmap_tracer
+src/dimergio/bpf/dimergio-mmap
+src/dimergio/bin/

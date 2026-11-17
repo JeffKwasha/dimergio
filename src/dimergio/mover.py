@@ -6,13 +6,29 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .model import Candidate, MoveEntry, MovePlan, Pool
-from .pool import PoolContext
+from .model import MoveEntry, MovePlan, Pool, fmt_bytes
+from .pool import PoolContext, canonical_pool_path
 from .state import StateManager
 
 
 class VerifyError(OSError):
     """Raised when SHA256 verification of a copied file fails."""
+
+
+def _resolve_source(pool: Pool, src_branch, rel: Path) -> tuple[Path, Path]:
+    """Return (real source path, canonical rel path) for a move.
+
+    Tracked paths are normally canonical, but offline/preloaded data may hold
+    symlink paths. We never move a symlink itself: resolve it to the real file
+    and take the canonical rel path of that real location.
+    """
+    src_path = src_branch.path / rel
+    if not src_path.is_symlink() and src_path.exists():
+        return src_path, rel
+    canonical = canonical_pool_path(pool, src_path)
+    if canonical is None:
+        return src_path, rel
+    return src_path.resolve(), canonical.relative_to(pool.mount)
 
 
 def execute_move_plan(
@@ -33,41 +49,47 @@ def execute_move_plan(
 
     for i, plan in enumerate(plans, 1):
         rel = plan.file.path.relative_to(pool.mount)
-        if plan.file.branch_idx >= len(pool.branches) or plan.target_branch_idx >= len(pool.branches):
-            print(f"  {i}/{total} \u2717 {plan.file.path.name:<50s}  invalid branch index")
+        label = plan.file.display_name or plan.file.path.name
+        if plan.file.branch_idx is None or plan.file.branch_idx < 0 or plan.file.branch_idx >= len(pool.branches):
+            print(f"  {i}/{total} \u2717 {label:<50s}  unresolvable source branch (path recorded via a symlink/ghost path — re-run watch to re-track)")
+            failed.append(str(rel))
+            continue
+        if plan.target_branch_idx is None or plan.target_branch_idx < 0 or plan.target_branch_idx >= len(pool.branches):
+            print(f"  {i}/{total} \u2717 {label:<50s}  invalid target branch index")
             failed.append(str(rel))
             continue
         src_branch = pool.branches[plan.file.branch_idx]
         dst_branch = pool.branches[plan.target_branch_idx]
-        if src_branch is None or dst_branch is None:
-            print(f"  {i}/{total} \u2717 {plan.file.path.name:<50s}  unknown branch")
+
+        # Never move a symlink: resolve to the real file and re-derive the
+        # canonical rel path (live sessions already track canonical paths).
+        src_path, canonical_rel = _resolve_source(pool, src_branch, rel)
+        dst_path = dst_branch.path / canonical_rel
+
+        if not src_path.exists():
+            print(f"  {i}/{total} \u2717 {label:<50s}  source not found: {src_path} (stale or recorded via a symlink — re-run watch to re-track)")
             failed.append(str(rel))
+            operations.append({"pool_path": str(rel), "src": src_branch.label, "dst": dst_branch.label, "bytes": 0, "ok": False})
             continue
 
-        src_path = src_branch.path / rel
-        dst_path = dst_branch.path / rel
-
         if dry_run:
-            print(f"  {i}/{total} dry-run {plan.file.path.name:<50s}  {src_branch.label} \u2192 {dst_branch.label}")
+            print(f"  {i}/{total} dry-run {label:<50s}  {src_branch.label} \u2192 {dst_branch.label}")
             succeeded += 1
             continue
 
         try:
-            if plan.is_rename_only:
-                entry = _smart_rename(src_path, dst_path, prefix, state, str(rel), src_branch.label, dst_branch.label)
-            else:
-                entry = _copy_and_rename(src_path, dst_path, prefix, state, str(rel), src_branch.label, dst_branch.label, verify)
+            entry = _copy_and_rename(src_path, dst_path, prefix, state, str(rel), src_branch.label, dst_branch.label, verify)
 
-            copied = 0 if plan.is_rename_only else entry.file_size
+            copied = entry.file_size
             total_bytes += copied
             operations.append({"pool_path": str(rel), "src": src_branch.label, "dst": dst_branch.label, "bytes": copied, "ok": True})
-            print(f"  {i}/{total} \u2713 {plan.file.path.name:<50s}  {src_branch.label} \u2192 {dst_branch.label}  {_fmt_bytes(copied)}")
+            print(f"  {i}/{total} \u2713 {label:<50s}  {src_branch.label} \u2192 {dst_branch.label}  {fmt_bytes(copied)}")
             succeeded += 1
 
         except OSError as e:
-            if dst_path.exists() and not plan.is_rename_only:
+            if dst_path.exists():
                 dst_path.unlink(missing_ok=True)
-            print(f"  {i}/{total} \u2717 {plan.file.path.name:<50s}  {e}")
+            print(f"  {i}/{total} \u2717 {label:<50s}  {e}")
             failed.append(str(rel))
             operations.append({"pool_path": str(rel), "src": src_branch.label, "dst": dst_branch.label, "bytes": 0, "ok": False})
 
@@ -78,43 +100,12 @@ def execute_move_plan(
             print(f"Original files renamed with prefix '{prefix}'.")
             print()
             print("Restart your program and test. If everything works, run:")
-            print(f"  dimergio cleanup --pool {pool.mount}")
+            print(f"  dimergio cleanup --pool {pool.mount} -d")
     else:
         print("No files were moved.")
 
     return succeeded, len(failed), failed, operations, total_bytes
 
-
-def _smart_rename(
-    src_path: Path,
-    dst_path: Path,
-    prefix: str,
-    state: StateManager,
-    pool_path: str,
-    src_label: str,
-    dst_label: str,
-) -> MoveEntry:
-    renamed_name = f"{prefix}{src_path.name}"
-    renamed_path = src_path.parent / renamed_name
-
-    if renamed_path.exists():
-        renamed_path.rename(dst_path)
-    elif src_path.exists():
-        src_path.rename(dst_path)
-    else:
-        raise OSError(f"source not found: {src_path}")
-
-    entry = MoveEntry(
-        pool_path=pool_path,
-        source_branch=src_label,
-        target_branch=dst_label,
-        original_basename=src_path.name,
-        renamed_basename=dst_path.name,
-        moved_at=datetime.now(tz=timezone.utc).isoformat(),
-        file_size=dst_path.stat().st_size,
-    )
-    state.add(entry)
-    return entry
 
 
 def _copy_and_rename(
@@ -173,13 +164,3 @@ def _hash_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def _fmt_bytes(b: int) -> str:
-    if b >= 1 << 30:
-        return f"{b / (1<<30):.1f}GB"
-    if b >= 1 << 20:
-        return f"{b / (1<<20):.0f}MB"
-    if b >= 1 << 10:
-        return f"{b / (1<<10):.0f}KB"
-    return f"{b}B"

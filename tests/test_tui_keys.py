@@ -6,18 +6,26 @@ as a lone ``\x1b`` (Esc) and kick the user back to MONITOR from SELECT.
 
 The fix delegates key parsing to ``readchar.readkey()``, which returns
 complete, unambiguous keystroke strings, and routes all scrolling through
-the pure ``_apply_nav`` helper. The MONITOR and SELECT screens were merged
+the pure ``apply_nav`` helper. The MONITOR and SELECT screens were merged
 into a single BROWSE screen with continuous sampling, and fatrace's process
 and reader thread are now owned together by ``start_fatrace``/
 ``stop_fatrace`` (so a respawn can never leave a running fatrace with no
 reader). These tests lock that behavior in without needing a real terminal.
 """
 
+import shutil
 import subprocess
 import threading
 from unittest import mock
 
-from dimergio.collector import Collector, _apply_nav
+from dimergio.collector import Collector
+from dimergio.tui_keys import (
+    apply_nav,
+    decode_terminfo_escapes,
+    normalize_key,
+    read_key,
+    terminfo_keymap,
+)
 
 
 def _make_collector() -> Collector:
@@ -61,61 +69,195 @@ def test_readchar_enter_is_lf():
     assert key.ENTER == "\n"
 
 
-# ─── _apply_nav: the shared navigation source of truth ──────────────
+# ─── escape-sequence dialect normalization ───────────────────────────
+def test_normalize_key_canonical_forms_pass_through():
+    """The canonical CSI arrow/home/end sequences are unchanged, so every
+    dialect maps onto them and readchar's constants stay the source of truth."""
+
+    assert normalize_key("\x1b[A") == "\x1b[A"
+    assert normalize_key("\x1b[B") == "\x1b[B"
+    assert normalize_key("\x1b[C") == "\x1b[C"
+    assert normalize_key("\x1b[D") == "\x1b[D"
+    assert normalize_key("\x1b[H") == "\x1b[H"
+    assert normalize_key("\x1b[F") == "\x1b[F"
+
+
+def test_normalize_key_application_cursor_mode():
+    """Terminals running with application-cursor (DECCKM) send SS3 ``\x1bO*``;
+    these must decode to the same keys as plain CSI arrows."""
+
+    assert normalize_key("\x1bOA") == "\x1b[A"
+    assert normalize_key("\x1bOB") == "\x1b[B"
+    assert normalize_key("\x1bOC") == "\x1b[C"
+    assert normalize_key("\x1bOD") == "\x1b[D"
+    assert normalize_key("\x1bOH") == "\x1b[H"
+    assert normalize_key("\x1bOF") == "\x1b[F"
+
+
+def test_normalize_key_kitty_and_modified_arrows():
+    """The kitty keyboard protocol (and xterm modifier encodings) prefix
+    arrows with parameters; modifiers are stripped for navigation/sort."""
+
+    assert normalize_key("\x1b[1;1A") == "\x1b[A"  # kitty plain up
+    assert normalize_key("\x1b[1;2A") == "\x1b[A"  # kitty shift-up
+    assert normalize_key("\x1b[1;5C") == "\x1b[C"  # kitty ctrl-right
+    assert normalize_key("\x1b[1A") == "\x1b[A"    # DEC prefix form
+    assert normalize_key("\x1b[1;5B") == "\x1b[B"  # xterm ctrl-down
+
+
+def test_normalize_key_alternate_home_end_page():
+    """xterm alternate (application-keypad) Home/End and the page keys decode
+    to the canonical sequences."""
+
+    assert normalize_key("\x1b[1~") == "\x1b[H"
+    assert normalize_key("\x1b[7~") == "\x1b[H"
+    assert normalize_key("\x1b[4~") == "\x1b[F"
+    assert normalize_key("\x1b[8~") == "\x1b[F"
+    assert normalize_key("\x1b[5~") == "\x1b[5~"
+    assert normalize_key("\x1b[6~") == "\x1b[6~"
+    assert normalize_key("\x1b[5;2~") == "\x1b[5~"
+
+
+def test_normalize_key_csi_u_codes():
+    """The kitty CSI-u protocol encodes plain keys as ``\x1b[<code>u``."""
+
+    assert normalize_key("\x1b[27u") == "\x1b"
+    assert normalize_key("\x1b[13u") == "\n"
+    assert normalize_key("\x1b[9u") == "\t"
+    assert normalize_key("\x1b[32u") == " "
+    assert normalize_key("\x1b[1u") == "\x1b[H"
+    assert normalize_key("\x1b[4u") == "\x1b[F"
+    assert normalize_key("\x1b[27;5u") == "\x1b"
+
+
+def test_normalize_key_ordinary_keys_unchanged():
+    """Letters, Tab, Enter and lone Esc must pass through untouched."""
+
+    assert normalize_key("q") == "q"
+    assert normalize_key("\t") == "\t"
+    assert normalize_key("\n") == "\n"
+    assert normalize_key("\x1b") == "\x1b"
+    assert normalize_key(" ") == " "
+
+
+# ─── terminfo resolution (broad compatibility) ───────────────────────
+_FAKE_INFOCMP = "\n".join([
+    "\tkcub1=\\EOD,",
+    "\tkcud1=\\EOB,",
+    "\tkcuf1=\\EOC,",
+    "\tkcuu1=\\EOA,",
+    "\tkend=\\EOF,",
+    "\tkhome=\\EOH,",
+    "\tknp=\\E[6~,",
+    "\tkpp=\\E[5~,",
+    "\tka1=\\EOP,",   # F1-style app-keypad: ignored (not a navigation cap)
+])
+
+
+def _fake_run(args, **_kwargs):
+    return subprocess.CompletedProcess(args, 0, stdout=_FAKE_INFOCMP, stderr="")
+
+
+def test_decode_terminfo_escapes():
+
+    assert decode_terminfo_escapes(r"\E[D") == "\x1b[D"
+    assert decode_terminfo_escapes(r"\E[1~") == "\x1b[1~"
+    assert decode_terminfo_escapes(r"^I") == "\t"
+    assert decode_terminfo_escapes(r"\s") == " "
+    assert decode_terminfo_escapes(r"\E\023") == "\x1b\x13"
+
+
+def test_terminfo_keymap_uses_infocmp_for_current_term():
+    """Broad compatibility: key sequences come from the *current* $TERM's
+    terminfo entry, not from a fixed table."""
+    import os
+
+    with mock.patch.object(os.environ, "get", return_value="xterm-256color"), \
+            mock.patch.object(shutil, "which", return_value="/usr/bin/infocmp"), \
+            mock.patch.object(subprocess, "run", side_effect=_fake_run):
+        keymap = terminfo_keymap()
+    assert keymap == {
+        "\x1bOD": "\x1b[D", "\x1bOB": "\x1b[B", "\x1bOC": "\x1b[C",
+        "\x1bOA": "\x1b[A", "\x1bOF": "\x1b[F", "\x1bOH": "\x1b[H",
+        "\x1b[6~": "\x1b[6~", "\x1b[5~": "\x1b[5~",
+    }
+
+
+def test_terminfo_keymap_falls_back_to_none():
+    """No TERM, missing infocmp, or an unknown terminal must yield None so the
+    kitty-compatible dialect normalizer is used instead."""
+    import os
+
+    with mock.patch.object(os.environ, "get", return_value=""):
+        assert terminfo_keymap() is None
+    with mock.patch.object(os.environ, "get", return_value="xterm-256color"), \
+            mock.patch.object(shutil, "which", return_value=None):
+        assert terminfo_keymap() is None
+    with mock.patch.object(os.environ, "get", return_value="weirdterm"), \
+            mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")), \
+            mock.patch.object(shutil, "which", return_value="/usr/bin/infocmp"):
+        assert terminfo_keymap() is None
+
+
+# ─── apply_nav: the shared navigation source of truth ──────────────
 def test_nav_up_down_clamped():
-    assert _apply_nav(0, 0, 10, 5, "down") == (0, 1)
-    assert _apply_nav(0, 0, 10, 5, "up") == (0, 0)  # clamp at top
-    assert _apply_nav(0, 9, 10, 5, "down") == (5, 9)  # clamp at bottom + scroll
+    assert apply_nav(0, 0, 10, 5, "down") == (0, 1)
+    assert apply_nav(0, 0, 10, 5, "up") == (0, 0)  # clamp at top
+    assert apply_nav(0, 9, 10, 5, "down") == (5, 9)  # clamp at bottom + scroll
 
 
 def test_nav_scroll_follows_selection():
     # Selected moves past the visible window -> scroll follows.
-    assert _apply_nav(0, 4, 10, 5, "down") == (1, 5)
-    assert _apply_nav(0, 5, 10, 5, "down") == (2, 6)
+    assert apply_nav(0, 4, 10, 5, "down") == (1, 5)
+    assert apply_nav(0, 5, 10, 5, "down") == (2, 6)
     # Moving up above the scroll origin pulls scroll back.
-    assert _apply_nav(1, 1, 10, 5, "up") == (0, 0)
+    assert apply_nav(1, 1, 10, 5, "up") == (0, 0)
 
 
 def test_nav_page_home_end():
-    assert _apply_nav(0, 0, 10, 5, "page_down") == (5, 9)
-    assert _apply_nav(5, 9, 10, 5, "page_up") == (0, 0)
-    assert _apply_nav(0, 0, 10, 5, "end") == (5, 9)
-    assert _apply_nav(5, 9, 10, 5, "home") == (0, 0)
+    assert apply_nav(0, 0, 10, 5, "page_down") == (5, 9)
+    assert apply_nav(5, 9, 10, 5, "page_up") == (0, 0)
+    # Home/End no longer scroll lists — they switch focus between the file
+    # and process lists, so apply_nav ignores them.
+    assert apply_nav(0, 0, 10, 5, "end") == (0, 0)
+    assert apply_nav(5, 9, 10, 5, "home") == (5, 9)
 
 
 def test_nav_unknown_key_leaves_state_unchanged():
-    assert _apply_nav(3, 3, 10, 5, "not-a-key") == (3, 3)
+    assert apply_nav(3, 3, 10, 5, "not-a-key") == (3, 3)
 
 
 def test_nav_empty_list_is_safe():
-    assert _apply_nav(0, 0, 0, 5, "down") == (0, 0)
-    assert _apply_nav(0, 0, 0, 5, "end") == (0, 0)
+    assert apply_nav(0, 0, 0, 5, "down") == (0, 0)
+    assert apply_nav(0, 0, 0, 5, "page_down") == (0, 0)
 
 
 # ─── Navigation keys are identical in monitor and select modes ──────
 def test_nav_kind_mapping_is_complete():
-    """Every navigation verb _apply_nav knows is bound in the _Keys map."""
-    from dimergio.collector import _Keys
+    """Every navigation verb apply_nav knows is bound in the Keys map."""
+    from dimergio.tui_keys import Keys
 
-    nav_kind = _Keys().NAV
-    for kind in ("up", "down", "page_up", "page_down", "home", "end"):
+    nav_kind = Keys().NAV
+    for kind in ("up", "down", "page_up", "page_down"):
         assert any(v == kind for v in nav_kind.values())
 
 
 def test_keys_is_single_source_of_truth():
-    """Bindings live only on _Keys; handlers/legend must not hardcode keys.
+    """Bindings live only on Keys; handlers/legend must not hardcode keys.
 
     Guards the DRY refactor: the interactive handlers reference ``KEYS.*`` and
-    the on-screen hints come from ``_Keys`` rather than duplicated literals.
+    the on-screen hints come from ``Keys`` rather than duplicated literals.
     """
     import inspect
 
-    from dimergio.collector import Collector, _Keys
+    from dimergio.collector import Collector
+    from dimergio.tui_keys import Keys
 
-    keys = _Keys()
+    keys = Keys()
     assert keys.SORT[0] == "iowait_per_mb"
     assert keys.ENTER and keys.ESC and keys.SPACE
-    assert len(keys.SHIFT_DIGIT) == 10
+    assert keys.FOCUS_TOGGLE == "\t"
+    assert keys.PROC_SORT == ("mmap", "reads", "iowait")
 
     src = inspect.getsource(Collector._run_interactive)
     # The old scattered lookup tables must be gone.
@@ -124,11 +266,54 @@ def test_keys_is_single_source_of_truth():
     assert "_NAV_KIND" not in src
     # Handlers dispatch through the shared bindings object.
     assert "KEYS.ENTER" in src
-    assert "KEYS.SHIFT_DIGIT" in src
     assert "KEYS.NAV" in src
-    # Legend hints are sourced from _Keys, not inline strings.
+    assert "KEYS.FOCUS_TOGGLE" in src
+    assert "KEYS.PROC_SORT" in src
+    # Legend hints are sourced from Keys, not inline strings.
     assert "KEYS.BROWSE_HINT" in src
     assert "KEYS.PREVIEW_HINT" in src
+
+
+def test_no_digit_mark_keys():
+    """0-9 / Shift+0-9 mark shortcuts are removed — SPACE on the selected row
+    is the only way to cycle a file's target branch."""
+    import inspect
+
+    from dimergio.collector import Collector, Keys
+
+    assert not hasattr(Keys(), "SHIFT_DIGIT")
+    src = inspect.getsource(Collector._run_interactive)
+    assert "SHIFT_DIGIT" not in src
+    assert "key.isdigit()" not in src
+    # SPACE (mark the selected file) remains the marking gesture.
+    assert "KEYS.SPACE" in src
+
+
+def test_tab_toggles_focus_and_left_right_sort_focused_panel():
+    """TAB switches files↔procs; Left/Right re-sort the *focused* panel, so
+    the procs panel gets its own sort cycle while files keep theirs."""
+    import inspect
+
+    from dimergio.collector import Collector
+
+    src = inspect.getsource(Collector._run_interactive)
+    assert "KEYS.FOCUS_TOGGLE" in src
+    # Sort handlers act on the focused panel (proc_sort vs sort_key).
+    assert "proc_sort = _cycle_sort_key" in src
+    assert "KEYS.PROC_SORT" in src
+
+
+def test_empty_procs_list_falls_through_to_files():
+    """Focus on an empty process list must not swallow arrows — it falls back
+    to the file list so navigation/sort never feel dead."""
+    import inspect
+
+    from dimergio.collector import Collector
+
+    src = inspect.getsource(Collector._run_interactive)
+    assert "if not _proc_visible_rows():" in src
+    assert 'focus = "files"' in src
+    assert 'focus == "procs"' in src
 
 
 # ─── fatrace lifecycle owns proc + reader thread together ───────────
@@ -267,3 +452,62 @@ def test_browse_enter_can_flip_in_preview():
     )
     assert assigns_in_preview, "browse handler should be able to enter preview"
     assert "in_preview" in nonlocals, "in_preview must be nonlocal or the flag never flips"
+
+
+# ─── read_key: a bare Esc must not block or eat the next key ────────
+def _reader(chunks, waits):
+    data = list(chunks)
+    gates = list(waits)
+
+    def read():
+        return data.pop(0) if data else None
+
+    def wait():
+        return gates.pop(0) if gates else False
+
+    return read, wait
+
+
+def test_read_key_bare_escape_returns_escape():
+    read, wait = _reader(["\x1b"], [False])
+    keymap = {"\x1bOA": "\x1b[A"}
+
+    assert read_key(read, wait, keymap) == "\x1b"
+
+
+def test_read_key_escape_then_other_key_does_not_swallow_it():
+    read, wait = _reader(["\x1b", "q"], [True])
+
+    assert read_key(read, wait, None) == "\x1bq"
+
+
+def test_read_key_plain_key():
+    read, wait = _reader(["q"], [])
+
+    assert read_key(read, wait, None) == "q"
+
+
+def test_read_key_csi_arrow_from_terminfo():
+    read, wait = _reader(["\x1b", "[", "A"], [True, True, False])
+    keymap = {"\x1b[A": "\x1b[A"}
+
+    assert read_key(read, wait, keymap) == "\x1b[A"
+
+
+def test_read_key_ss3_arrow_from_terminfo():
+    read, wait = _reader(["\x1b", "O", "D"], [True, True])
+    keymap = {"\x1bOD": "\x1b[D"}
+
+    assert read_key(read, wait, keymap) == "\x1b[D"
+
+
+def test_read_key_kitty_modified_arrow_without_keymap():
+    read, wait = _reader(["\x1b", "[", "1", ";", "5", "C"], [True, True, True, True, True, False])
+
+    assert read_key(read, wait, None) == "\x1b[C"
+
+
+def test_read_key_timeout_mid_sequence_falls_back_to_dialect_table():
+    read, wait = _reader(["\x1b", "[", "A"], [True, False])
+
+    assert read_key(read, wait, None) == "\x1b["

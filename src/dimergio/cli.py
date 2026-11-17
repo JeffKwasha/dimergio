@@ -7,8 +7,17 @@ from pathlib import Path
 
 from .collector import Collector
 from .config import load as load_config
+from .model import fmt_bytes, speed_color
 from .mover import execute_move_plan
-from .pool import PoolContext, find_pool, find_pool_for_cwd
+from .pool import (
+    PoolContext,
+    branch_holding,
+    find_pool,
+    find_pool_for_cwd,
+    read_mounts,
+    resolve_tracked,
+    volume_mounts,
+)
 from .state import StateManager
 
 logger = logging.getLogger(__name__)
@@ -53,11 +62,11 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
     logger.info("pool=%s data=%s", pool.mount, data_path)
     for b in pool.branches:
-        kind = "HDD" if b.rotational else "SSD"
-        logger.info("branch: %s [%s] on %s", b.path, kind, b.device)
+        logger.info("branch: %s [%s %dx] on %s", b.path, b.speed_class, b.speed_weight, b.device)
 
     cfg = load_config()
     iowait_ms = args.iowait_interval or cfg.get("iowait_interval_ms", 10)
+    symlink_depth = cfg.get("symlink_depth", 3)
 
     debug_log = args.debug_log
     if debug_log is True:
@@ -81,7 +90,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 return
         else:
             from .stats import load_accumulators
-            accumulators = load_accumulators(pool, data_path)
+            accumulators = load_accumulators(pool)
             if not accumulators:
                 print("No saved stats found. Run a watch session first.")
                 return
@@ -91,6 +100,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             data_path=data_path,
             no_interactive=args.no_interactive,
             preloaded=accumulators,
+            symlink_depth=symlink_depth,
             debug_log=debug_log,
         )
         collector.run()
@@ -99,7 +109,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             cfg = load_config()
             summary = execute_move_plan(collector.move_plans, pool, prefix=cfg.get("prefix", "_dimergio_"), verify=args.verify)
             _, moved = _print_results(summary, pool)
-            _offer_free_originals(pool, cfg.get("prefix", "_dimergio_"), moved)
+            _note_free_originals(pool, moved)
     else:
         collector = Collector(
             pool=pool,
@@ -108,9 +118,11 @@ def cmd_watch(args: argparse.Namespace) -> None:
             pid=args.pid,
             use_sudo=args.sudo,
             iowait_interval_ms=iowait_ms,
+            symlink_depth=symlink_depth,
             no_interactive=args.no_interactive,
             verbose=args.verbose,
             debug_log=debug_log,
+            mmap_pids=args.mmap_pid,
         )
         accumulators = collector.run()
 
@@ -118,12 +130,12 @@ def cmd_watch(args: argparse.Namespace) -> None:
             cfg = load_config()
             summary = execute_move_plan(collector.move_plans, pool, prefix=cfg.get("prefix", "_dimergio_"), verify=args.verify)
             _, moved = _print_results(summary, pool)
-            _offer_free_originals(pool, cfg.get("prefix", "_dimergio_"), moved)
+            _note_free_originals(pool, moved)
 
         if accumulators:
             from .stats import load_stats, merge_stats, save_stats
             existing = load_stats(pool)
-            merged = merge_stats(existing, accumulators, data_path)
+            merged = merge_stats(existing, accumulators, pool)
             save_stats(pool, merged)
 
 
@@ -158,7 +170,7 @@ def cmd_status(args: argparse.Namespace) -> None:
             e.pool_path,
             f"[{sc}]{status}[/{sc}]",
             e.moved_at[:19],
-            _fmt_bytes(e.file_size),
+            fmt_bytes(e.file_size),
         )
 
     Console().print(table)
@@ -167,7 +179,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 def cmd_cleanup(args: argparse.Namespace) -> None:
     ctx = PoolContext(args.pool)
     state = ctx.state
-    days = args.days if args.days is not None else 7
+    days = args.days if args.days is not None else load_config().get("cleanup_days", 7)
     entries = state.unverified(older_than_days=days)
 
     if not entries:
@@ -244,6 +256,7 @@ def _parse_log(log_path: Path, pool, data_path: Path) -> dict:
     import os as _os
 
     my_uid = _os.getuid()
+    mounts = volume_mounts(pool, read_mounts())
     accumulators: dict[Path, FileAccumulator] = {}
 
     with open(log_path) as f:
@@ -258,27 +271,24 @@ def _parse_log(log_path: Path, pool, data_path: Path) -> dict:
                 continue
             if int(m.group("uid")) != my_uid:
                 continue
-            path = Path(m.group("path"))
             try:
-                path.relative_to(data_path)
-            except ValueError:
+                file_path = resolve_tracked(pool, Path(m.group("path")), data_path, mounts)
+            except (OSError, ValueError):
+                continue
+            if file_path is None:
                 continue
 
-            branch_idx = 0
-            rel = path.relative_to(data_path)
-            for idx, branch in enumerate(pool.branches):
-                if (branch.path / rel).exists():
-                    branch_idx = idx
-                    break
+            branch_idx = branch_holding(pool, file_path)
+            if branch_idx is None:
+                continue
 
             ts = float(m.group("ts"))
-            key = path
-            if key in accumulators:
-                acc = accumulators[key]
+            if file_path in accumulators:
+                acc = accumulators[file_path]
             else:
-                acc = FileAccumulator(path=key, branch_idx=branch_idx, first_seen=ts)
-                accumulators[key] = acc
-            acc.observe(ts, 0.0)
+                acc = FileAccumulator(path=file_path, branch_idx=branch_idx, first_seen=ts)
+                accumulators[file_path] = acc
+            acc.observe(ts)
 
     return accumulators
 
@@ -314,16 +324,6 @@ def _undo_one(ctx: PoolContext, entry, state: StateManager) -> None:
     state.remove(entry.pool_path)
 
 
-def _fmt_bytes(b: int) -> str:
-    if b >= 1 << 30:
-        return f"{b / (1<<30):.1f}GB"
-    if b >= 1 << 20:
-        return f"{b / (1<<20):.0f}MB"
-    if b >= 1 << 10:
-        return f"{b / (1<<10):.0f}KB"
-    return f"{b}B"
-
-
 def _branch_speed_class(pool, label: str) -> str:
     for b in pool.branches:
         if b.label == label:
@@ -341,7 +341,6 @@ def _print_results(summary, pool) -> tuple[int, list[str]]:
     from rich.console import Console
     from rich.table import Table
 
-    color = {"hdd": "blue", "ssd": "teal", "nvme": "green"}
     console = Console()
     table = Table(title="Move operations", show_header=True, header_style="bold", expand=False)
     table.add_column("#", justify="right", width=4)
@@ -351,15 +350,15 @@ def _print_results(summary, pool) -> tuple[int, list[str]]:
     table.add_column("COPIED", justify="right", width=10, no_wrap=True)
 
     for i, op in enumerate(operations, 1):
-        sc = color.get(_branch_speed_class(pool, op["src"]), "red")
-        dc = color.get(_branch_speed_class(pool, op["dst"]), "red")
+        sc = speed_color(_branch_speed_class(pool, op["src"]))
+        dc = speed_color(_branch_speed_class(pool, op["dst"]))
         if op["ok"]:
             table.add_row(
                 str(i),
                 f"[{sc}]{op['src']}[/{sc}]",
                 f"[{dc}]{op['dst']}[/{dc}]",
                 op["pool_path"],
-                _fmt_bytes(op["bytes"]),
+                fmt_bytes(op["bytes"]),
             )
             moved_paths.append(op["pool_path"])
         else:
@@ -367,13 +366,13 @@ def _print_results(summary, pool) -> tuple[int, list[str]]:
 
     console.print(table)
     unit = "GB" if total_bytes > 10 * (1 << 30) else "MB"
-    console.print(f"[bold]Total copied:[/bold] {_fmt_bytes(total_bytes)} ({unit})  —  {succeeded} moved, {failed} failed")
+    console.print(f"[bold]Total copied:[/bold] {fmt_bytes(total_bytes)} ({unit})  —  {succeeded} moved, {failed} failed")
     return succeeded, moved_paths
 
 
-def _offer_free_originals(pool, prefix: str, moved_paths: list[str]) -> None:
-    """After moves, offer to delete the now-redundant renamed originals
-    for the files moved in this session only."""
+def _note_free_originals(pool, moved_paths: list[str]) -> None:
+    """After moves, note the redundant renamed originals left behind and
+    point at the command that can verify & free them later."""
     if not moved_paths:
         return
     ctx = PoolContext(pool)
@@ -402,17 +401,8 @@ def _offer_free_originals(pool, prefix: str, moved_paths: list[str]) -> None:
     if not to_free:
         return
 
-    ans = input(f"\nFree {len(to_free)} redundant original file(s) ({_fmt_bytes(total)})? [y/N]: ").strip().lower()
-    if ans in ("y", "yes"):
-        for e, renamed in to_free:
-            try:
-                renamed.unlink()
-                state.remove(e.pool_path)
-                print(f"  Freed: {e.source_branch}/{e.pool_path}")
-            except OSError as ex:
-                print(f"  Error freeing {renamed}: {ex}")
-    else:
-        print("  Kept originals. Run 'dimergio cleanup' to verify & free later, or 'dimergio undo' to revert.")
+    print(f"\n{len(to_free)} redundant original file(s) ({fmt_bytes(total)}) kept on the source branch.")
+    print(f"To verify & free them, run 'dimergio cleanup --pool {ctx.mount} -d'; 'dimergio undo' reverts.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -437,8 +427,10 @@ def build_parser() -> argparse.ArgumentParser:
     wp.add_argument("--process",
                     help="Auto-quit when this process exits (matches /proc/<pid>/cmdline)")
     wp.add_argument("--pid", type=int, help="Auto-quit when this PID exits")
+    wp.add_argument("--mmap-pid", type=int, action="append", default=[],
+                    help="Watch mmap page-fault reads of this PID (repeatable; needs dimergio-mmap)")
     wp.add_argument("--no-sudo", dest="sudo", action="store_false",
-                    help="Run fatrace without sudo (requires CAP_SYS_ADMIN on fatrace binary)")
+                    help="Run fatrace without sudo (needs cap_sys_admin,cap_dac_read_search on the fatrace binary)")
     wp.add_argument("--iowait-interval", type=int, default=10,
                     help="I/O wait sampling interval in ms (default: 10 = 100Hz)")
     wp.add_argument("--verify", action="store_true",
@@ -480,5 +472,6 @@ def build_parser() -> argparse.ArgumentParser:
         debug_log=None,
         offline=False,
         from_log=None,
+        mmap_pid=[],
     )
     return parser
